@@ -114,9 +114,10 @@ cd forge && uv run pytest tests/ -v
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODEL_ID` | *(required)* | HuggingFace model identifier |
-| `STORAGE_TYPE` | `s3` | `s3`, `fs`, `gcs`, `azblob`, `none` |
+| `STORAGE_TYPE` | `s3` | `s3`, `fs`, `gcs`, `none` |
 | `STORAGE_BUCKET` | — | Bucket name (required for cloud backends) |
 | `STORAGE_ROOT` | — | Root directory (required for `fs`) |
+| `STORAGE_CREDENTIAL_PATH` | — | GCS key file path (gcs only; unset = ADC / Workload Identity) |
 | `PORT` | `8080` | HTTP listen port |
 | `EXECUTION_PROVIDER` | `cpu` | `cpu`, `cuda`, `tensorrt`, `coreml` |
 | `FORGE_URL` | — | Forge service URL (enables conversion tier) |

@@ -1,9 +1,8 @@
 //! Backend-agnostic model storage operations via Apache OpenDAL.
 //!
 //! Implements download and upload for the storage cache tier using
-//! OpenDAL's [`Operator`] abstraction. Works identically across S3,
-//! local filesystem, GCS, Azure Blob, and in-memory backends (RSLV-01,
-//! RSLV-04, D-11).
+//! OpenDAL's [`Operator`] abstraction. Works identically across S3, GCS,
+//! local filesystem, and in-memory backends (RSLV-01, RSLV-04, D-11).
 //!
 //! Downloads use an atomic temp-dir-then-rename pattern to prevent
 //! serving partial files (D-12). Uploads are unconditional with

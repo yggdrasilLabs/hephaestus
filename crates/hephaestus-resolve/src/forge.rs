@@ -13,12 +13,13 @@ use crate::error::ResolveError;
 
 /// Response from the Forge conversion service.
 ///
-/// Contains the S3 paths of the converted model files and metadata
+/// Contains the storage paths of the converted model files and metadata
 /// about the conversion process.
 #[derive(Deserialize, Debug)]
 pub struct ForgeResponse {
-    /// S3 paths where the converted ONNX files were uploaded.
-    pub s3_paths: Vec<String>,
+    /// Storage paths, relative to the configured backend root, where the
+    /// converted ONNX files were uploaded.
+    pub storage_paths: Vec<String>,
     /// Metadata about the conversion process.
     pub metadata: ConversionMetadata,
 }
@@ -48,7 +49,7 @@ pub struct ConversionMetadata {
 pub trait ForgeClient: Send + Sync {
     /// Request model conversion to ONNX format.
     ///
-    /// Returns a [`ForgeResponse`] containing the S3 paths and
+    /// Returns a [`ForgeResponse`] containing the storage paths and
     /// conversion metadata on success, or a [`ResolveError`] on failure.
     fn convert(
         &self,
@@ -81,7 +82,7 @@ struct ConvertRequest {
 ///
 /// Sends POST requests to `{base_url}/convert` with a JSON body
 /// containing the model ID. The response is deserialized into a
-/// [`ForgeResponse`] with S3 paths and conversion metadata.
+/// [`ForgeResponse`] with storage paths and conversion metadata.
 ///
 /// Configured with a timeout from `FORGE_TIMEOUT_SECS` (default 600s,
 /// per D-04) to prevent unbounded blocking on long conversions.
@@ -221,7 +222,7 @@ mod tests {
     #[test]
     fn forge_response_deserializes_from_json() {
         let json = r#"{
-            "s3_paths": ["s3://bucket/models/org/model/model.onnx", "s3://bucket/models/org/model/tokenizer.json"],
+            "storage_paths": ["org/model/model.onnx", "org/model/tokenizer.json"],
             "metadata": {
                 "architecture": "distilbert",
                 "original_format": "pytorch",
@@ -231,7 +232,7 @@ mod tests {
         }"#;
 
         let resp: ForgeResponse = serde_json::from_str(json).expect("should deserialize");
-        assert_eq!(resp.s3_paths.len(), 2);
+        assert_eq!(resp.storage_paths.len(), 2);
         assert_eq!(resp.metadata.architecture, "distilbert");
         assert_eq!(resp.metadata.original_format, "pytorch");
         assert!((resp.metadata.conversion_duration_secs - 42.5).abs() < f64::EPSILON);

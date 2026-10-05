@@ -6,7 +6,7 @@ A unified ONNX model inference runtime in Rust — one container that loads, ser
 
 - **Single binary, any model** — classifiers, embeddings, seq2seq, token classifiers via ONNX Runtime
 - **3-tier model resolution** — storage cache → HuggingFace Hub → Forge conversion, fully automatic
-- **Backend-agnostic storage** — S3, GCS, Azure Blob, local filesystem via [Apache OpenDAL](https://github.com/apache/opendal)
+- **Backend-agnostic storage** — S3, GCS, local filesystem via [Apache OpenDAL](https://github.com/apache/opendal)
 - **Forge conversion service** — companion Python service converts non-ONNX HuggingFace models to ONNX format
 - **One model per pod** — configured via environment variables, scales with Kubernetes natively
 - **CPU + GPU support** — toggle execution provider via env var; compile with `--features cuda` for GPU acceleration
@@ -25,7 +25,7 @@ A unified ONNX model inference runtime in Rust — one container that loads, ser
 | **Tokenization** | `tokenizers` 0.23 (HuggingFace Rust-native) |
 | **HTTP server** | `axum` 0.8 |
 | **Model downloads** | `hf-hub` 1.0 (HuggingFace Hub client) |
-| **Storage abstraction** | `opendal` 0.58 (S3, filesystem, GCS, Azure) |
+| **Storage abstraction** | `opendal` 0.58 (S3, GCS, filesystem) |
 | **Tensors** | `ndarray` 0.17 |
 | **Config** | `envy` (environment variables, no CLI parser) |
 | **Metrics** | `metrics` + `metrics-exporter-prometheus` |
@@ -149,11 +149,12 @@ hephaestus/
 | Variable | Default | Description |
 |----------|---------|-------------|
 | **`MODEL_ID`** | *(required)* | HuggingFace model identifier (e.g., `org/model-name`) |
-| **`STORAGE_TYPE`** | `s3` | Storage backend: `s3`, `fs`, `gcs`, `azblob`, `none` |
-| **`STORAGE_BUCKET`** | — | Bucket name (required for S3/GCS/Azure) |
+| **`STORAGE_TYPE`** | `s3` | Storage backend: `s3`, `fs`, `gcs`, `none` |
+| **`STORAGE_BUCKET`** | — | Bucket name (required for S3/GCS) |
 | **`STORAGE_PREFIX`** | — | Path prefix applied across all backends |
 | **`STORAGE_ROOT`** | — | Root directory (required when `STORAGE_TYPE=fs`) |
-| **`STORAGE_REGION`** | — | Cloud region for S3/GCS |
+| **`STORAGE_REGION`** | — | AWS region (S3 only) |
+| **`STORAGE_CREDENTIAL_PATH`** | — | Path to a GCS service-account JSON key (GCS only). When unset, falls back to `GOOGLE_APPLICATION_CREDENTIALS`, then GKE Workload Identity via the metadata server. Read by Hephaestus and Forge. |
 | **`EXECUTION_PROVIDER`** | `cpu` | ONNX execution provider: `cpu`, `cuda`, `tensorrt`, `coreml` (GPU providers require matching cargo feature) |
 | **`PORT`** | `8080` | HTTP listen port |
 | **`LOG_LEVEL`** | `info` | Log verbosity |
@@ -173,6 +174,17 @@ STORAGE_BUCKET=my-model-cache \
 STORAGE_REGION=us-east-1 \
 cargo run -p hephaestus
 ```
+
+### Run with GCS storage cache
+
+```bash
+MODEL_ID=sentence-transformers/all-MiniLM-L6-v2 \
+STORAGE_TYPE=gcs \
+STORAGE_BUCKET=my-model-cache \
+cargo run -p hephaestus
+```
+
+On GKE with Workload Identity no extra variables are needed; elsewhere, set `STORAGE_CREDENTIAL_PATH` to a mounted service-account key file.
 
 ### Run with local filesystem cache
 

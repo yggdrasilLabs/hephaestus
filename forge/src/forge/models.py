@@ -44,5 +44,5 @@ class ConversionMetadata(BaseModel):
 class ConvertResponse(BaseModel):
     """Response returned after a successful conversion."""
 
-    s3_paths: list[str]
+    storage_paths: list[str]
     metadata: ConversionMetadata

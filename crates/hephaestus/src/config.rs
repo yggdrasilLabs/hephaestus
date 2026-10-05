@@ -3,11 +3,20 @@
 //! All configuration comes from environment variables (D-11). This is
 //! a k8s-only service -- no CLI parser, no config files.
 
+use std::collections::HashMap;
 use std::path::{Component, PathBuf};
 
 use anyhow::{Context, bail};
 use hephaestus_core::ExecutionProvider;
 use serde::Deserialize;
+
+/// Accepted `STORAGE_TYPE` values (T-06-05 allowlist).
+///
+/// Every entry other than `none` must have a matching opendal `services-*`
+/// cargo feature enabled in the workspace manifest. The test
+/// `storage_operator_builds_for_every_allowed_storage_type` enforces this,
+/// so adding a backend here without its feature fails CI.
+const ALLOWED_STORAGE_TYPES: &[&str] = &["s3", "fs", "gcs", "none"];
 
 /// Runtime configuration deserialized from environment variables.
 ///
@@ -63,14 +72,14 @@ pub struct Config {
     pub otel_exporter_otlp_endpoint: Option<String>,
 
     /// Storage backend type (env `STORAGE_TYPE`).
-    /// Accepted values: `s3`, `fs`, `gcs`, `azblob`, `none`.
+    /// Accepted values: `s3`, `fs`, `gcs`, `none`.
     /// Defaults to `"s3"` when unset (D-02).
     /// `none` disables the storage tier entirely (D-05).
     #[serde(default = "default_storage_type")]
     pub storage_type: String,
 
     /// Storage bucket name (env `STORAGE_BUCKET`).
-    /// Required for S3, GCS, and Azure backends.
+    /// Required for S3 and GCS backends.
     #[serde(default)]
     pub storage_bucket: Option<String>,
 
@@ -84,9 +93,17 @@ pub struct Config {
     #[serde(default)]
     pub storage_root: Option<String>,
 
-    /// Cloud region for S3/GCS backends (env `STORAGE_REGION`).
+    /// AWS region for the S3 backend (env `STORAGE_REGION`).
+    /// Ignored by other backends.
     #[serde(default)]
     pub storage_region: Option<String>,
+
+    /// Path to a GCS service-account JSON key file (env `STORAGE_CREDENTIAL_PATH`).
+    /// Only applied when `STORAGE_TYPE=gcs`. When unset, OpenDAL falls back to
+    /// `GOOGLE_APPLICATION_CREDENTIALS` and then the GKE metadata server
+    /// (Workload Identity).
+    #[serde(default)]
+    pub storage_credential_path: Option<String>,
 
     /// Forge conversion service URL (optional, env `FORGE_URL`, D-09).
     /// When set, enables the Forge conversion tier for models without ONNX exports.
@@ -266,11 +283,11 @@ impl Config {
         // Validate execution provider early (T-EP-01).
         self.parsed_execution_provider()?;
         // T-06-05: validate storage_type against explicit allowlist.
-        const ALLOWED_STORAGE_TYPES: &[&str] = &["s3", "fs", "gcs", "azblob", "none"];
         if !ALLOWED_STORAGE_TYPES.contains(&self.storage_type.as_str()) {
             bail!(
-                "invalid STORAGE_TYPE '{}' -- accepted values: s3, fs, gcs, azblob, none",
+                "invalid STORAGE_TYPE '{}' -- accepted values: {}",
                 self.storage_type,
+                ALLOWED_STORAGE_TYPES.join(", "),
             );
         }
 
@@ -329,6 +346,70 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Build the OpenDAL storage operator for the configured backend (D-01, D-02).
+    ///
+    /// Returns `Ok(None)` when `STORAGE_TYPE=none`, which disables the storage
+    /// tier entirely (D-05). Otherwise maps the storage env config onto OpenDAL
+    /// config keys and wraps the operator in a retry layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `STORAGE_TYPE=fs` without `STORAGE_ROOT`, or if
+    /// OpenDAL rejects the configuration (e.g. a missing bucket, S3 without a
+    /// region, or a backend whose cargo feature is not compiled in).
+    pub fn storage_operator(&self) -> Result<Option<opendal::Operator>, anyhow::Error> {
+        if self.storage_type == "none" {
+            return Ok(None);
+        }
+        let op = opendal::Operator::via_iter(self.storage_type.as_str(), self.storage_options()?)
+            .with_context(|| format!("failed to build {} storage operator", self.storage_type))?
+            .layer(opendal::layers::RetryLayer::new().with_max_times(3));
+        Ok(Some(op))
+    }
+
+    /// Map storage env config onto OpenDAL config keys for the configured backend.
+    ///
+    /// `bucket` is passed whenever set. `region` is passed only to `s3` and
+    /// `credential_path` only to `gcs`, so backend-specific settings never
+    /// reach an unintended backend. `root` comes from `STORAGE_ROOT` (joined
+    /// with `STORAGE_PREFIX`) for `fs`, and from `/{STORAGE_PREFIX}` for cloud
+    /// backends (D-04).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `STORAGE_TYPE=fs` and `STORAGE_ROOT` is not set (D-17).
+    fn storage_options(&self) -> Result<HashMap<String, String>, anyhow::Error> {
+        let mut options = HashMap::new();
+        if let Some(ref bucket) = self.storage_bucket {
+            options.insert("bucket".to_string(), bucket.clone());
+        }
+        if self.storage_type == "s3"
+            && let Some(ref region) = self.storage_region
+        {
+            options.insert("region".to_string(), region.clone());
+        }
+        if self.storage_type == "gcs"
+            && let Some(ref credential_path) = self.storage_credential_path
+        {
+            options.insert("credential_path".to_string(), credential_path.clone());
+        }
+        // D-04: STORAGE_PREFIX/STORAGE_ROOT -> OpenDAL "root" config.
+        if self.storage_type == "fs" {
+            let root = self
+                .storage_root
+                .as_deref()
+                .context("storage_root is required when storage_type is fs")?;
+            let fs_root = match self.storage_prefix.as_deref() {
+                Some(prefix) => format!("{root}/{prefix}"),
+                None => root.to_string(),
+            };
+            options.insert("root".to_string(), fs_root);
+        } else if let Some(ref prefix) = self.storage_prefix {
+            options.insert("root".to_string(), format!("/{prefix}"));
+        }
+        Ok(options)
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +435,7 @@ mod tests {
             storage_prefix: None,
             storage_root: None,
             storage_region: None,
+            storage_credential_path: None,
             forge_url: None,
             forge_timeout_secs: 600,
             model_profile: None,
@@ -603,7 +685,7 @@ mod tests {
 
     #[test]
     fn test_validate_accepts_all_storage_types() {
-        for st in &["s3", "fs", "gcs", "azblob", "none"] {
+        for st in &["s3", "fs", "gcs", "none"] {
             let mut config = config_with_model_path(None);
             config.storage_type = st.to_string();
             // fs requires storage_root (D-17)
@@ -612,6 +694,114 @@ mod tests {
             }
             let result = config.validate();
             assert!(result.is_ok(), "storage_type={st} should be accepted, got: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_azblob() {
+        // Arrange
+        let mut config = config_with_model_path(None);
+        config.storage_type = "azblob".to_string();
+
+        // Act
+        let result = config.validate();
+
+        // Assert
+        assert!(result.is_err(), "azblob should no longer be an accepted storage_type");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("accepted values"),
+            "error should list accepted values: {msg}"
+        );
+    }
+
+    #[test]
+    fn storage_operator_builds_for_every_allowed_storage_type() {
+        // Arrange -- the tempdir guard must outlive the loop so the fs root exists.
+        let tmpdir = tempfile::tempdir().expect("should create temp dir");
+        let root = tmpdir.path().to_str().expect("path should be valid UTF-8");
+
+        for st in ALLOWED_STORAGE_TYPES {
+            let mut config = config_with_model_path(None);
+            config.storage_type = (*st).to_string();
+            config.storage_bucket = Some("test-bucket".to_string());
+            config.storage_region = Some("us-east-1".to_string());
+            config.storage_root = Some(root.to_string());
+
+            // Act
+            let result = config.storage_operator();
+
+            // Assert -- every non-none entry needs its opendal services-* feature.
+            let operator = result.unwrap_or_else(|e| {
+                panic!("storage_type={st} should build an operator, got: {e:#}")
+            });
+            if *st == "none" {
+                assert!(operator.is_none(), "storage_type=none should yield no operator");
+            } else {
+                assert!(operator.is_some(), "storage_type={st} should yield an operator");
+            }
+        }
+    }
+
+    #[test]
+    fn storage_options_passes_region_only_to_s3() {
+        for st in &["s3", "gcs", "fs"] {
+            // Arrange
+            let mut config = config_with_model_path(None);
+            config.storage_type = (*st).to_string();
+            config.storage_bucket = Some("test-bucket".to_string());
+            config.storage_region = Some("us-east-1".to_string());
+            config.storage_root = Some("/data/models".to_string());
+
+            // Act
+            let options = config
+                .storage_options()
+                .unwrap_or_else(|e| panic!("storage_options for {st} should succeed: {e:#}"));
+
+            // Assert
+            if *st == "s3" {
+                assert_eq!(
+                    options.get("region").map(String::as_str),
+                    Some("us-east-1"),
+                    "s3 options should carry the region"
+                );
+            } else {
+                assert!(
+                    !options.contains_key("region"),
+                    "{st} options must not carry a region: {options:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn storage_options_passes_credential_path_only_to_gcs() {
+        for st in &["s3", "gcs", "fs"] {
+            // Arrange
+            let mut config = config_with_model_path(None);
+            config.storage_type = (*st).to_string();
+            config.storage_bucket = Some("test-bucket".to_string());
+            config.storage_root = Some("/data/models".to_string());
+            config.storage_credential_path = Some("/var/secrets/gcs/key.json".to_string());
+
+            // Act
+            let options = config
+                .storage_options()
+                .unwrap_or_else(|e| panic!("storage_options for {st} should succeed: {e:#}"));
+
+            // Assert
+            if *st == "gcs" {
+                assert_eq!(
+                    options.get("credential_path").map(String::as_str),
+                    Some("/var/secrets/gcs/key.json"),
+                    "gcs options should carry the credential path"
+                );
+            } else {
+                assert!(
+                    !options.contains_key("credential_path"),
+                    "{st} options must not carry a credential_path: {options:?}"
+                );
+            }
         }
     }
 

@@ -113,7 +113,7 @@ impl<F: ForgeClient> ModelResolver<F> {
 
     /// Resolve a model ID to a local directory containing ONNX files.
     ///
-    /// Resolution order: S3 cache -> HuggingFace -> Forge conversion.
+    /// Resolution order: storage cache -> HuggingFace -> Forge conversion.
     /// Returns the path to a directory containing `model.onnx` (or
     /// `onnx/model.onnx`), `tokenizer.json`, and `config.json`.
     ///
@@ -158,7 +158,7 @@ impl<F: ForgeClient> ModelResolver<F> {
                     "model resolved from HuggingFace"
                 );
 
-                // Spawn background S3 cache-back after HF success (D-12).
+                // Spawn background storage cache-back after HF success (D-12).
                 self.spawn_cache_back(model_id, &model_dir);
 
                 return Ok(model_dir);
@@ -182,15 +182,15 @@ impl<F: ForgeClient> ModelResolver<F> {
 
         match forge_result {
             Ok(forge_resp) => {
-                // Forge converted the model and uploaded to S3.
-                // Log conversion metadata and download the model from S3.
+                // Forge converted the model and uploaded it to storage.
+                // Log conversion metadata and download the model from storage.
                 tracing::info!(
                     model_id,
                     tier = "forge",
-                    s3_paths = ?forge_resp.s3_paths,
+                    storage_paths = ?forge_resp.storage_paths,
                     architecture = %forge_resp.metadata.architecture,
                     conversion_duration_secs = forge_resp.metadata.conversion_duration_secs,
-                    "Forge conversion succeeded, downloading from S3"
+                    "Forge conversion succeeded, downloading from storage"
                 );
 
                 if let Some(op) = &self.operator {
