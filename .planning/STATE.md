@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-08-26)
 Phase: 12
 Plan: Not started
 Status: Phase complete — ready for verification
-Last activity: 2026-08-29 — Phase 12 complete
+Last activity: 2026-10-05 - Completed quick task 261005-h8p: Add GCS storage support via OpenDAL and drop azblob
 
 Progress: [████████████████████] 9/9 plans (100%)
 
@@ -172,6 +172,7 @@ None yet.
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 260826-ren | Wire EXECUTION_PROVIDER config to ort session builder | 2026-08-26 | d8a9e30 | [260826-ren-wire-execution-provider-config-to-ort-se](./quick/260826-ren-wire-execution-provider-config-to-ort-se/) |
+| 261005-h8p | Add GCS storage support via OpenDAL and drop azblob | 2026-10-05 | 8153e45 | [261005-h8p-add-gcs-storage-support-via-opendal-and-](./quick/261005-h8p-add-gcs-storage-support-via-opendal-and-/) |
 
 ## Deferred Items
 
