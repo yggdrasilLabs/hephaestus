@@ -17,7 +17,7 @@ router = APIRouter()
 
 @router.post("/convert", response_model=ConvertResponse)
 async def convert(body: ConvertRequest, request: Request) -> ConvertResponse:
-    """Accept a conversion request and return S3 paths with metadata.
+    """Accept a conversion request and return storage paths with metadata.
 
     Pydantic validates ``model_id`` automatically via the
     :class:`ConvertRequest` field validator.  The actual conversion is

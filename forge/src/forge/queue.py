@@ -89,7 +89,7 @@ class ConversionQueue:
         logger.info("conversion_validated", model_id=model_id)
 
         op = build_operator(settings)
-        s3_paths = await asyncio.to_thread(
+        storage_paths = await asyncio.to_thread(
             upload_to_storage,
             op,
             model_id,
@@ -98,10 +98,10 @@ class ConversionQueue:
         logger.info(
             "conversion_uploaded",
             model_id=model_id,
-            s3_paths=s3_paths,
+            storage_paths=storage_paths,
         )
 
         # Clean up temp dir after successful upload.
         shutil.rmtree(output_dir, ignore_errors=True)
 
-        return ConvertResponse(s3_paths=s3_paths, metadata=metadata)
+        return ConvertResponse(storage_paths=storage_paths, metadata=metadata)

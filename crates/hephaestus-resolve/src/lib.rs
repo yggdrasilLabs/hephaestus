@@ -1,6 +1,6 @@
 //! Model resolution for the Hephaestus ONNX inference runtime.
 //!
-//! This crate implements the 3-tier model resolution chain: S3 cache,
+//! This crate implements the 3-tier model resolution chain: storage cache,
 //! HuggingFace Hub, and Forge conversion. Callers interact only through
 //! [`ModelResolver::resolve()`] -- all download, caching, and retry
 //! details are hidden behind this single method (RSLV-05).

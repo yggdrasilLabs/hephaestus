@@ -49,7 +49,7 @@ class TestConvertEndpoint:
     async def test_convert_success(self, client: AsyncClient) -> None:
         """POST /convert with valid model_id returns 200 + ConvertResponse."""
         canned = ConvertResponse(
-            s3_paths=["models/org/test-model/model.onnx"],
+            storage_paths=["models/org/test-model/model.onnx"],
             metadata=ConversionMetadata(
                 architecture="bert",
                 original_format="pytorch",
@@ -69,7 +69,7 @@ class TestConvertEndpoint:
 
         assert resp.status_code == 200
         body = resp.json()
-        assert body["s3_paths"] == ["models/org/test-model/model.onnx"]
+        assert body["storage_paths"] == ["models/org/test-model/model.onnx"]
         assert body["metadata"]["architecture"] == "bert"
 
     async def test_convert_invalid_model_id_traversal(
