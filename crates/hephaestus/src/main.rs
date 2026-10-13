@@ -19,7 +19,6 @@ use hephaestus_core::{
 };
 use hephaestus_resolve::{HttpForgeClient, ModelResolver};
 use scylla_client::{ClientConfig, ScyllaClient, ServiceName};
-use tonic::service::LayerExt;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -300,15 +299,10 @@ async fn main() -> Result<(), anyhow::Error> {
         .build_v1()
         .context("failed to build gRPC reflection service")?;
 
-    let inference_service = hephaestus_api::entitlement::grpc_guard(
-        scylla.clone(),
-        scylla_service.clone(),
-    )
-    .named_layer(
+    let inference_service =
         hephaestus_proto::v1::inference_service_server::InferenceServiceServer::new(
             GrpcInferenceService::new(state.clone()),
-        ),
-    );
+        );
 
     let grpc_router = tonic::service::Routes::new(inference_service)
         .add_service(health_service)
@@ -316,11 +310,12 @@ async fn main() -> Result<(), anyhow::Error> {
         .into_axum_router();
 
     // 7b. Build REST router and merge with gRPC (SC-06: existing REST unchanged).
-    let rest_router = build_router(
-        state.clone(),
-        hephaestus_api::entitlement::http_guard(scylla, scylla_service),
-    );
+    let rest_router = build_router(state.clone());
     let app = rest_router.merge(grpc_router);
+
+    // 7c. Guard the whole app: every request except the probe, metrics and
+    //     gRPC health paths passes the scylla entitlement check.
+    let app = hephaestus_api::entitlement::guard(app, scylla, scylla_service);
 
     // Drain-timeout watchdog (D-13).
     //
