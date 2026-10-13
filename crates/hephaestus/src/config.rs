@@ -24,6 +24,10 @@ const ALLOWED_STORAGE_TYPES: &[&str] = &["s3", "fs", "gcs", "none"];
 ///
 /// - `MODEL_ID` -- identifier for the model (e.g., `distilbert-base-uncased-finetuned-sst-2-english`).
 ///   The binary crashes with a clear error if this is missing (D-13).
+/// - `SCYLLA_SERVICE_NAME` -- scylla service every inference request is checked against.
+/// - `SCYLLA_UPSTREAM_URL` -- base URL of `scylla-api`, e.g. `http://scylla-api:8080`.
+/// - `SCYLLA_NATS_URL` -- NATS broker for scylla's nudges, e.g. `nats://nats:4222`.
+/// - `SCYLLA_BANLIST_PATH` -- directory for scylla's on-disk ban list; created if missing.
 ///
 /// # Optional
 ///
@@ -154,6 +158,18 @@ pub struct Config {
     /// Defaults to 50ms.
     #[serde(default = "default_batch_max_wait_ms")]
     pub batch_max_wait_ms: u64,
+
+    /// Scylla service every inference request is checked against (env `SCYLLA_SERVICE_NAME`, required).
+    pub scylla_service_name: String,
+
+    /// Base URL of `scylla-api` (env `SCYLLA_UPSTREAM_URL`, required).
+    pub scylla_upstream_url: String,
+
+    /// NATS broker for scylla's nudges (env `SCYLLA_NATS_URL`, required).
+    pub scylla_nats_url: String,
+
+    /// Directory for scylla's on-disk ban list (env `SCYLLA_BANLIST_PATH`, required).
+    pub scylla_banlist_path: PathBuf,
 }
 
 fn default_storage_type() -> String {
@@ -216,7 +232,7 @@ impl Config {
     /// Returns an error if `MODEL_ID` is not set or if any env var
     /// fails to deserialize into the expected type.
     pub fn from_env() -> Result<Self, anyhow::Error> {
-        envy::from_env::<Self>().context("failed to load config from environment (MODEL_ID is required)")
+        envy::from_env::<Self>().context("failed to load config from environment (MODEL_ID and SCYLLA_* are required)")
     }
 
     /// Resolve and validate the model directory path.
@@ -446,6 +462,10 @@ mod tests {
             batch_enabled: false,
             batch_max_size: 8,
             batch_max_wait_ms: 50,
+            scylla_service_name: "inference".to_string(),
+            scylla_upstream_url: "http://scylla-api:8080".to_string(),
+            scylla_nats_url: "nats://nats:4222".to_string(),
+            scylla_banlist_path: PathBuf::from("/var/lib/scylla"),
         }
     }
 
@@ -455,6 +475,10 @@ mod tests {
         // Safety: env var mutation is process-global but acceptable in unit
         // tests that are not run in parallel with other env-dependent tests.
         unsafe { std::env::set_var("MODEL_ID", "test-model") };
+        unsafe { std::env::set_var("SCYLLA_SERVICE_NAME", "inference") };
+        unsafe { std::env::set_var("SCYLLA_UPSTREAM_URL", "http://scylla-api:8080") };
+        unsafe { std::env::set_var("SCYLLA_NATS_URL", "nats://nats:4222") };
+        unsafe { std::env::set_var("SCYLLA_BANLIST_PATH", "/var/lib/scylla") };
 
         // Act
         let config = Config::from_env().expect("should load config with MODEL_ID set");
@@ -468,6 +492,10 @@ mod tests {
 
         // Cleanup
         unsafe { std::env::remove_var("MODEL_ID") };
+        unsafe { std::env::remove_var("SCYLLA_SERVICE_NAME") };
+        unsafe { std::env::remove_var("SCYLLA_UPSTREAM_URL") };
+        unsafe { std::env::remove_var("SCYLLA_NATS_URL") };
+        unsafe { std::env::remove_var("SCYLLA_BANLIST_PATH") };
     }
 
     #[test]

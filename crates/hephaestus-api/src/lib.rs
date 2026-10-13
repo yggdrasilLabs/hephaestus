@@ -6,6 +6,7 @@
 //! and the router is constructed via [`build_router`].
 
 pub mod batcher;
+pub mod entitlement;
 pub mod error;
 pub mod grpc;
 pub mod handlers;

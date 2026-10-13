@@ -18,6 +18,8 @@ use hephaestus_core::{
     PipelineKind, Seq2SeqPipeline, TokenClassifierPipeline, detect_profile,
 };
 use hephaestus_resolve::{HttpForgeClient, ModelResolver};
+use scylla_client::{ClientConfig, ScyllaClient, ServiceName};
+use tonic::service::LayerExt;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -61,6 +63,21 @@ async fn main() -> Result<(), anyhow::Error> {
     // 2c. Build OpenDAL storage operator from config (D-01, D-02, D-05).
     let operator = config.storage_operator()?;
     tracing::info!(storage_type = %config.storage_type, "storage operator constructed");
+
+    // 2d. Start the scylla client that guards every inference request. Returns once
+    //     the NATS subscription is live and a ban list is installed.
+    let scylla_service = ServiceName::parse(&config.scylla_service_name)
+        .context("invalid SCYLLA_SERVICE_NAME")?;
+    std::fs::create_dir_all(&config.scylla_banlist_path)
+        .context("failed to create SCYLLA_BANLIST_PATH")?;
+    let scylla = ScyllaClient::start(ClientConfig::new(
+        config.scylla_upstream_url.clone(),
+        config.scylla_nats_url.clone(),
+        config.scylla_banlist_path.clone(),
+    ))
+    .await
+    .context("failed to start scylla client")?;
+    tracing::info!(service = %scylla_service, "scylla client started");
 
     // 3. Resolve model directory: local override (MODEL_PATH) or automatic resolution.
     let model_dir = if config.model_path.is_some() {
@@ -283,10 +300,15 @@ async fn main() -> Result<(), anyhow::Error> {
         .build_v1()
         .context("failed to build gRPC reflection service")?;
 
-    let inference_service =
+    let inference_service = hephaestus_api::entitlement::grpc_guard(
+        scylla.clone(),
+        scylla_service.clone(),
+    )
+    .named_layer(
         hephaestus_proto::v1::inference_service_server::InferenceServiceServer::new(
             GrpcInferenceService::new(state.clone()),
-        );
+        ),
+    );
 
     let grpc_router = tonic::service::Routes::new(inference_service)
         .add_service(health_service)
@@ -294,7 +316,10 @@ async fn main() -> Result<(), anyhow::Error> {
         .into_axum_router();
 
     // 7b. Build REST router and merge with gRPC (SC-06: existing REST unchanged).
-    let rest_router = build_router(state.clone());
+    let rest_router = build_router(
+        state.clone(),
+        hephaestus_api::entitlement::http_guard(scylla, scylla_service),
+    );
     let app = rest_router.merge(grpc_router);
 
     // Drain-timeout watchdog (D-13).

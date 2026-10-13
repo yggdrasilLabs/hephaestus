@@ -27,6 +27,7 @@ tracing-subscriber.workspace = true
 tower-http.workspace = true
 futures-util.workspace = true
 ndarray.workspace = true
+scylla-client.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

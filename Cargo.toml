@@ -54,6 +54,9 @@ reqwest = { version = "0.13", features = ["json"] }
 # Storage abstraction (Phase 6)
 opendal = { version = "0.58", features = ["services-s3", "services-fs", "services-gcs"] }
 
+# Entitlement checks (scylla EntitlementLayer)
+scylla-client = { git = "https://github.com/minervacq/scylla", rev = "e86015847bbf7645185e6b1c048820b5b1105cc4" }
+
 # Audio feature extraction
 mel_spec = "0.4"
 

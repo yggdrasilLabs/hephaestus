@@ -8,6 +8,7 @@ hephaestus-core = { path = "../hephaestus-core" }
 hephaestus-api = { path = "../hephaestus-api" }
 hephaestus-proto = { path = "../hephaestus-proto" }
 hephaestus-resolve = { path = "../hephaestus-resolve" }
+scylla-client.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 opendal.workspace = true

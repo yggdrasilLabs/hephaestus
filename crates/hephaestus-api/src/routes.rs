@@ -10,6 +10,7 @@ use axum::Router;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::entitlement::HttpGuard;
 use crate::handlers;
 use crate::metrics;
 use crate::state::AppState;
@@ -33,10 +34,14 @@ const MAX_BODY_SIZE: usize = 1024 * 1024;
 /// Applies a 1 MB request body size limit to prevent oversized payloads.
 /// WebSocket upgrade requests are GET requests with no body, so the limit
 /// layer does not interfere with the upgrade handshake.
-pub fn build_router(state: Arc<AppState>) -> Router {
+///
+/// `/infer` and `/ws/transcribe` are guarded by `entitlement`; health and
+/// metrics are not.
+pub fn build_router(state: Arc<AppState>, entitlement: HttpGuard) -> Router {
     Router::new()
         .route("/infer", post(handlers::infer))
         .route("/ws/transcribe", get(ws::ws_transcribe))
+        .route_layer(entitlement)
         .route("/healthz/live", get(handlers::liveness))
         .route("/healthz/ready", get(handlers::readiness))
         .route("/metrics", get(metrics::metrics_handler))
