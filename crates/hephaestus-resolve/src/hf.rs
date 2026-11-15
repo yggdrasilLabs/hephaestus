@@ -5,7 +5,7 @@
 //! and returns the snapshot root directory for `ClassifierPipeline::new()`.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use hf_hub::{HFClient, HFError};
 
@@ -14,6 +14,7 @@ use crate::encoder_decoder::{
     ONNX_SUBDIR_PREFIX, is_whisper_config,
 };
 use crate::error::ResolveError;
+use crate::external_data;
 
 /// Split a combined model ID into `(owner, name)` components.
 ///
@@ -33,7 +34,8 @@ pub(crate) fn split_model_id(model_id: &str) -> (String, String) {
 ///
 /// Tries `onnx/model.onnx` first, falls back to `model.onnx`. If neither
 /// exists, returns [`ResolveError::NoOnnxExport`] per D-04. Also downloads
-/// `tokenizer.json` and `config.json`.
+/// `tokenizer.json` and `config.json`, and the external data files the
+/// graph refers to, if any (see [`fetch_external_data`]).
 ///
 /// Returns the snapshot root directory containing all model files.
 pub(crate) async fn download_from_hf(
@@ -46,12 +48,12 @@ pub(crate) async fn download_from_hf(
     let repo = client.model(&owner, &name);
 
     // Try onnx/model.onnx first, then model.onnx (D-04, Pitfall 4).
-    let onnx_path = match repo.download_file().filename("onnx/model.onnx").send().await {
-        Ok(path) => path,
+    let (onnx_file, onnx_path) = match repo.download_file().filename("onnx/model.onnx").send().await {
+        Ok(path) => ("onnx/model.onnx", path),
         Err(HFError::EntryNotFound { .. }) => {
             // Try flat layout.
             match repo.download_file().filename("model.onnx").send().await {
-                Ok(path) => path,
+                Ok(path) => ("model.onnx", path),
                 Err(HFError::EntryNotFound { .. }) => {
                     return Err(ResolveError::NoOnnxExport {
                         model_id: model_id.to_string(),
@@ -66,6 +68,18 @@ pub(crate) async fn download_from_hf(
             return Err(ResolveError::HuggingFace(e.to_string()));
         }
     };
+
+    // Weights kept outside the graph file. Nothing is requested for a
+    // graph that carries its own weights.
+    let repo_ref = &repo;
+    fetch_external_data(onnx_file, &onnx_path, &mut |filename: String| async move {
+        match repo_ref.download_file().filename(filename).send().await {
+            Ok(path) => Ok(Some(path)),
+            Err(HFError::EntryNotFound { .. }) => Ok(None),
+            Err(e) => Err(ResolveError::HuggingFace(e.to_string())),
+        }
+    })
+    .await?;
 
     // Download supporting files.
     let _tokenizer = repo
@@ -159,7 +173,10 @@ pub(crate) async fn download_encoder_decoder_from_hf(
 ///    `decoder_model_merged.onnx`. After `decoder_model.onnx`, the merged
 ///    decoder is requested too; it is optional, so a miss or a failure
 ///    there does not stop the lookup.
-/// 4. `tokenizer.json` (required) and `generation_config.json` (optional).
+/// 4. The external data files of the fetched graphs, if any (see
+///    [`fetch_external_data`]); a graph that carries its own weights adds
+///    no request.
+/// 5. `tokenizer.json` (required) and `generation_config.json` (optional).
 ///
 /// Returns the snapshot root directory, or [`ResolveError::NoOnnxExport`]
 /// when the repository holds no complete encoder-decoder export.
@@ -192,19 +209,38 @@ where
             continue;
         };
         let mut has_decoder = false;
+        // Graphs whose external data must come along: (file, local path,
+        // whether the export is unusable without it).
+        let mut graphs = vec![(format!("{prefix}{ENCODER_ONNX}"), encoder_path.clone(), true)];
         for decoder in DECODER_ONNX_CANDIDATES {
-            if fetch(format!("{prefix}{decoder}")).await?.is_some() {
+            let decoder_file = format!("{prefix}{decoder}");
+            if let Some(decoder_path) = fetch(decoder_file.clone()).await? {
                 has_decoder = true;
-                if decoder != MERGED_DECODER_ONNX
-                    && let Err(e) = fetch(format!("{prefix}{MERGED_DECODER_ONNX}")).await
-                {
-                    tracing::warn!(model_id, error = %e, "failed to download optional merged decoder");
+                graphs.push((decoder_file, decoder_path, true));
+                if decoder != MERGED_DECODER_ONNX {
+                    let merged_file = format!("{prefix}{MERGED_DECODER_ONNX}");
+                    match fetch(merged_file.clone()).await {
+                        Ok(Some(merged_path)) => graphs.push((merged_file, merged_path, false)),
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(model_id, error = %e, "failed to download optional merged decoder");
+                        }
+                    }
                 }
                 break;
             }
         }
         if !has_decoder {
             continue;
+        }
+        for (graph_file, graph_path, required) in &graphs {
+            match fetch_external_data(graph_file, graph_path, &mut fetch).await {
+                Ok(()) => {}
+                Err(e) if !required => {
+                    tracing::warn!(model_id, graph = %graph_file, error = %e, "failed to download external data of optional merged decoder");
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         if fetch("tokenizer.json".to_string()).await?.is_none() {
@@ -234,6 +270,46 @@ where
     }
 
     Err(no_onnx_export())
+}
+
+/// Fetch the external data files of a graph that was just downloaded.
+///
+/// `graph_file` is the graph's path in the repository and `graph_path` its
+/// local copy. The graph names its data files relative to its own
+/// directory, so they are requested from the same repository directory. A
+/// graph that carries its own weights -- every model served before
+/// external data was supported -- names none, and nothing is requested.
+///
+/// # Errors
+///
+/// Returns [`ResolveError::HuggingFace`] if a named file is not in the
+/// repository (the model cannot be loaded without it), and any error of
+/// `fetch` or of reading the local graph.
+async fn fetch_external_data<F, Fut>(
+    graph_file: &str,
+    graph_path: &Path,
+    fetch: &mut F,
+) -> Result<(), ResolveError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Option<PathBuf>, ResolveError>>,
+{
+    let locations = external_data::locations_of_graph(graph_path.to_path_buf()).await?;
+    let directory = graph_file.rsplit_once('/').map_or("", |(dir, _)| dir);
+    for location in locations {
+        let data_file = if directory.is_empty() {
+            location
+        } else {
+            format!("{directory}/{location}")
+        };
+        if fetch(data_file.clone()).await?.is_none() {
+            return Err(ResolveError::HuggingFace(format!(
+                "external data file '{data_file}' of '{graph_file}' is not in the repository (404)"
+            )));
+        }
+        tracing::info!(graph = graph_file, data_file = %data_file, "downloaded ONNX external data");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -419,6 +495,125 @@ mod tests {
 
         // Assert
         assert_eq!(result.expect("export should resolve"), repo.root.path());
+    }
+
+    #[tokio::test]
+    async fn encoder_decoder_export_fetches_external_data_of_each_graph() {
+        // Arrange -- encoder with its weights inline, decoders with
+        // external data in two naming conventions.
+        use crate::external_data::test_support::{inline_tensor, model, model_with_external_data};
+        let repo = FakeRepo::with_files(&[
+            "config.json",
+            "tokenizer.json",
+            "onnx/encoder_model.onnx",
+            "onnx/decoder_model.onnx",
+            "onnx/decoder_model.onnx_data",
+            "onnx/decoder_model_merged.onnx",
+            "onnx/decoder_model_merged.onnx.data",
+        ]);
+        let write = |name: &str, bytes: Vec<u8>| {
+            std::fs::write(repo.root.path().join(name), bytes).unwrap();
+        };
+        write("onnx/encoder_model.onnx", model(&[inline_tensor("w")]));
+        write(
+            "onnx/decoder_model.onnx",
+            model_with_external_data("decoder_model.onnx_data"),
+        );
+        write(
+            "onnx/decoder_model_merged.onnx",
+            model_with_external_data("decoder_model_merged.onnx.data"),
+        );
+
+        // Act
+        let root = repo.resolve().await.expect("export should resolve");
+
+        // Assert -- the data files are requested from the graphs' directory.
+        assert_eq!(root, repo.root.path());
+        assert_eq!(
+            repo.requested(),
+            vec![
+                "config.json",
+                "onnx/encoder_model.onnx",
+                "onnx/decoder_model.onnx",
+                "onnx/decoder_model_merged.onnx",
+                "onnx/decoder_model.onnx_data",
+                "onnx/decoder_model_merged.onnx.data",
+                "tokenizer.json",
+                "generation_config.json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn export_whose_external_data_is_missing_is_an_error() {
+        // Arrange -- the decoder names a data file the repository lacks.
+        use crate::external_data::test_support::model_with_external_data;
+        let repo = FakeRepo::with_files(&[
+            "config.json",
+            "tokenizer.json",
+            "onnx/encoder_model.onnx",
+            "onnx/decoder_model.onnx",
+        ]);
+        std::fs::write(
+            repo.root.path().join("onnx/decoder_model.onnx"),
+            model_with_external_data("decoder_model.onnx_data"),
+        )
+        .unwrap();
+
+        // Act
+        let err = repo.resolve().await.expect_err("incomplete export should fail");
+
+        // Assert -- a permanent error that names the file.
+        assert!(matches!(err, ResolveError::HuggingFace(_)), "unexpected error: {err:?}");
+        assert!(err.to_string().contains("onnx/decoder_model.onnx_data"), "unexpected error: {err}");
+        assert!(!err.is_transient());
+    }
+
+    #[tokio::test]
+    async fn external_data_is_fetched_next_to_a_single_file_graph() {
+        // Arrange
+        use crate::external_data::test_support::model_with_external_data;
+        let repo = FakeRepo::with_files(&["onnx/model.onnx", "onnx/model.onnx_data"]);
+        let graph_path = repo.root.path().join("onnx/model.onnx");
+        std::fs::write(&graph_path, model_with_external_data("model.onnx_data")).unwrap();
+        let repo_ref = &repo;
+        let mut fetch = |filename: String| async move {
+            repo_ref.requested.borrow_mut().push(filename.clone());
+            let path = repo_ref.root.path().join(&filename);
+            Ok(path.exists().then_some(path))
+        };
+
+        // Act
+        fetch_external_data("onnx/model.onnx", &graph_path, &mut fetch)
+            .await
+            .expect("data file should be fetched");
+
+        // Assert
+        assert_eq!(repo.requested(), vec!["onnx/model.onnx_data"]);
+    }
+
+    #[tokio::test]
+    async fn graph_without_external_data_requests_nothing_more() {
+        // Arrange -- a real graph with inline weights, and bytes that are
+        // not a graph at all.
+        use crate::external_data::test_support::{inline_tensor, model};
+        let repo = FakeRepo::with_files(&["model.onnx", "other.onnx"]);
+        std::fs::write(repo.root.path().join("model.onnx"), model(&[inline_tensor("w")])).unwrap();
+        let repo_ref = &repo;
+        let mut fetch = |filename: String| async move {
+            repo_ref.requested.borrow_mut().push(filename);
+            Ok(None)
+        };
+
+        // Act
+        for graph in ["model.onnx", "other.onnx"] {
+            fetch_external_data(graph, &repo.root.path().join(graph), &mut fetch)
+                .await
+                .expect("nothing to fetch");
+        }
+
+        // Assert
+        assert!(repo.requested().is_empty());
     }
 
     #[tokio::test]

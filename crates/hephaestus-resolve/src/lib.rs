@@ -7,6 +7,7 @@
 
 pub(crate) mod encoder_decoder;
 pub mod error;
+pub(crate) mod external_data;
 pub mod forge;
 pub(crate) mod hf;
 pub mod resolver;

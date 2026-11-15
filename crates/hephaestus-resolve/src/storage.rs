@@ -17,6 +17,7 @@ use crate::encoder_decoder::{
     ONNX_SUBDIR_PREFIX, is_whisper_config,
 };
 use crate::error::ResolveError;
+use crate::external_data;
 
 /// Required model files for a complete model directory.
 pub(crate) const MODEL_ONNX: &str = "model.onnx";
@@ -29,6 +30,11 @@ pub(crate) const ONNX_SUBDIR_MODEL: &str = "onnx/model.onnx";
 /// Keeps storage-downloaded models separate from hf-hub's content-addressed
 /// blob layout.
 pub(crate) const STORAGE_CACHE_SUBDIR: &str = "hephaestus/storage-cache";
+
+/// Bytes moved per request when an external data file is streamed to or
+/// from storage. External data files run to several gigabytes, so they are
+/// never held in memory whole.
+const STREAM_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 
 /// Construct a storage path from model ID and filename.
 ///
@@ -67,7 +73,7 @@ pub(crate) async fn download_model(
     let final_dir = cache_dir.join(STORAGE_CACHE_SUBDIR).join(model_id);
 
     // Already cached locally -- skip download.
-    if final_dir.exists() {
+    if final_dir.exists() && !discard_incomplete_local_copy(model_id, &final_dir).await {
         tracing::debug!(model_id, path = %final_dir.display(), "model already cached locally");
         return Ok(Some(final_dir));
     }
@@ -124,6 +130,13 @@ pub(crate) async fn download_model(
     tokio::fs::write(temp_dir.path().join(TOKENIZER_JSON), &tokenizer_data).await?;
     tokio::fs::write(temp_dir.path().join(CONFIG_JSON), &config_data).await?;
 
+    // Weights kept outside the graph file. A stored graph whose data is
+    // not in storage cannot be loaded, so it counts as a miss and the
+    // next tier fetches (and stores) the complete model.
+    if !download_external_data(op, model_id, onnx_filename, temp_dir.path()).await? {
+        return Ok(None);
+    }
+
     // Atomic rename (same filesystem guarantees atomicity).
     tokio::fs::rename(temp_dir.path(), &final_dir).await?;
     // Prevent TempDir destructor from removing the now-renamed directory (D-12).
@@ -157,7 +170,7 @@ pub(crate) async fn download_encoder_decoder_model(
     let final_dir = cache_dir.join(STORAGE_CACHE_SUBDIR).join(model_id);
 
     // Already cached locally -- skip download.
-    if final_dir.exists() {
+    if final_dir.exists() && !discard_incomplete_local_copy(model_id, &final_dir).await {
         tracing::debug!(model_id, path = %final_dir.display(), "model already cached locally");
         return Ok(Some(final_dir));
     }
@@ -188,6 +201,7 @@ pub(crate) async fn download_encoder_decoder_model(
 
     // Encoder and decoder must sit in the same directory.
     let mut found = false;
+    let mut graphs = Vec::new();
     for prefix in ["", ONNX_SUBDIR_PREFIX] {
         let encoder = format!("{prefix}{ENCODER_ONNX}");
         if !download_file_into(op, model_id, &encoder, temp_dir.path()).await? {
@@ -197,10 +211,14 @@ pub(crate) async fn download_encoder_decoder_model(
             let path = format!("{prefix}{decoder}");
             if download_file_into(op, model_id, &path, temp_dir.path()).await? {
                 found = true;
+                graphs.push(encoder.clone());
+                graphs.push(path);
                 if decoder != MERGED_DECODER_ONNX {
                     // Optional: the graph for cached decoding.
                     let merged = format!("{prefix}{MERGED_DECODER_ONNX}");
-                    download_file_into(op, model_id, &merged, temp_dir.path()).await?;
+                    if download_file_into(op, model_id, &merged, temp_dir.path()).await? {
+                        graphs.push(merged);
+                    }
                 }
                 break;
             }
@@ -214,6 +232,13 @@ pub(crate) async fn download_encoder_decoder_model(
     if !found {
         // Dropping `temp_dir` removes anything written so far.
         return Ok(None);
+    }
+    // Weights kept outside the graph files; a graph without its data makes
+    // the stored set incomplete, which is a miss.
+    for graph in &graphs {
+        if !download_external_data(op, model_id, graph, temp_dir.path()).await? {
+            return Ok(None);
+        }
     }
 
     tokio::fs::write(temp_dir.path().join(TOKENIZER_JSON), &tokenizer_data).await?;
@@ -255,11 +280,126 @@ async fn download_file_into(
     Ok(true)
 }
 
+/// Download the external data files of a graph already written to `dir`.
+///
+/// `graph` is the graph's path relative to the model (`model.onnx`,
+/// `onnx/decoder_model.onnx`, ...). The data files it names are fetched
+/// from the same storage directory into the same local directory, in
+/// pieces of [`STREAM_CHUNK_BYTES`]. A graph that carries its own weights
+/// names none, and nothing is requested.
+///
+/// Returns `Ok(false)` when storage lacks one of the files: the stored
+/// model is incomplete and must not be served.
+async fn download_external_data(
+    op: &Operator,
+    model_id: &str,
+    graph: &str,
+    dir: &Path,
+) -> Result<bool, ResolveError> {
+    let locations = external_data::locations_of_graph(dir.join(graph)).await?;
+    let directory = graph.rsplit_once('/').map_or("", |(directory, _)| directory);
+    for location in locations {
+        let filename = if directory.is_empty() {
+            location
+        } else {
+            format!("{directory}/{location}")
+        };
+        if !download_file_streamed(op, model_id, &filename, dir).await? {
+            tracing::warn!(
+                model_id,
+                graph,
+                missing = %filename,
+                "stored model lacks an external data file; treating it as a cache miss"
+            );
+            return Ok(false);
+        }
+        tracing::info!(model_id, graph, data_file = %filename, "downloaded ONNX external data from storage");
+    }
+    Ok(true)
+}
+
+/// Download `{model_id}/{filename}` into `dir/{filename}` piece by piece.
+///
+/// Returns `Ok(true)` when the file was written and `Ok(false)` when it
+/// does not exist in storage.
+async fn download_file_streamed(
+    op: &Operator,
+    model_id: &str,
+    filename: &str,
+    dir: &Path,
+) -> Result<bool, ResolveError> {
+    use tokio::io::AsyncWriteExt;
+
+    let path = format_storage_path(model_id, filename);
+    let size = match op.stat(&path).await {
+        Ok(metadata) => metadata.content_length(),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(ResolveError::Storage(format!("stat {path}: {e}"))),
+    };
+    let reader = op
+        .reader(&path)
+        .await
+        .map_err(|e| ResolveError::Storage(format!("read {path}: {e}")))?;
+
+    let target = dir.join(filename);
+    if let Some(target_parent) = target.parent() {
+        tokio::fs::create_dir_all(target_parent).await?;
+    }
+    let mut file = tokio::fs::File::create(&target).await?;
+    let mut offset = 0_u64;
+    while offset < size {
+        let end = size.min(offset + STREAM_CHUNK_BYTES as u64);
+        let piece = reader
+            .read(offset..end)
+            .await
+            .map_err(|e| ResolveError::Storage(format!("read {path}: {e}")))?;
+        if piece.is_empty() {
+            return Err(ResolveError::Storage(format!(
+                "read {path}: storage returned no data at byte {offset} of {size}"
+            )));
+        }
+        offset += piece.len() as u64;
+        file.write_all(&piece.to_bytes()).await?;
+    }
+    file.flush().await?;
+    Ok(true)
+}
+
+/// Remove a locally cached model directory whose graphs lack external data.
+///
+/// Such a directory can only come from a build that did not know about
+/// external data; ONNX Runtime cannot load it. Returns `true` when the
+/// directory was removed, so the caller downloads the model afresh. A
+/// directory without external data -- or one that cannot be inspected --
+/// is left alone and used as before.
+async fn discard_incomplete_local_copy(model_id: &str, dir: &Path) -> bool {
+    let missing = match external_data::external_files_of_dir(dir.to_path_buf()).await {
+        Ok(files) => files.into_iter().find(|file| !file.present),
+        Err(_) => None,
+    };
+    let Some(missing) = missing else {
+        return false;
+    };
+    tracing::warn!(
+        model_id,
+        path = %dir.display(),
+        missing = %missing.relative_path.display(),
+        "locally cached model lacks an external data file; downloading it again"
+    );
+    tokio::fs::remove_dir_all(dir).await.is_ok()
+}
+
 /// Upload a model directory to storage for cache-back.
 ///
 /// Iterates files in `local_dir`, constructs storage paths as
 /// `{model_id}/{filename}`, and uploads each via `Operator::write()`.
 /// Upload is unconditional -- no existence check.
+///
+/// A graph may keep its weights in external data files. Nothing is
+/// uploaded unless every such file is present, so storage never receives
+/// a graph it cannot serve. The data files go first, piece by piece, and
+/// the graphs after them: an upload that is cut short leaves no graph
+/// without its data.
 ///
 /// On failure, returns `Err` so the caller can handle retry or
 /// log a warning.
@@ -268,25 +408,95 @@ pub(crate) async fn upload_model(
     model_id: &str,
     local_dir: &Path,
 ) -> Result<(), ResolveError> {
-    upload_files_recursive(op, model_id, local_dir, local_dir).await
+    let external = external_data::external_files_of_dir(local_dir.to_path_buf())
+        .await
+        .map_err(|e| {
+            ResolveError::Storage(format!(
+                "refusing to upload model '{model_id}': cannot check its external data: {e}"
+            ))
+        })?;
+    if let Some(missing) = external.iter().find(|file| !file.present) {
+        return Err(ResolveError::Storage(format!(
+            "refusing to upload incomplete model '{model_id}': external data file '{}' is missing",
+            missing.relative_path.display(),
+        )));
+    }
+
+    let external: Vec<PathBuf> = external.into_iter().map(|file| file.relative_path).collect();
+    for relative in &external {
+        upload_file_streamed(op, model_id, local_dir, relative).await?;
+    }
+    upload_files_recursive(op, model_id, local_dir, local_dir, &external).await
+}
+
+/// Upload `local_dir/relative` to `{model_id}/{relative}` piece by piece.
+async fn upload_file_streamed(
+    op: &Operator,
+    model_id: &str,
+    local_dir: &Path,
+    relative: &Path,
+) -> Result<(), ResolveError> {
+    use tokio::io::AsyncReadExt;
+
+    let storage_path = format_storage_path(model_id, &relative.to_string_lossy());
+    let local_path = local_dir.join(relative);
+    let failed =
+        |e: &dyn std::fmt::Display| ResolveError::Storage(format!("write failed for {storage_path}: {e}"));
+
+    let mut file = tokio::fs::File::open(&local_path).await.map_err(|e| {
+        ResolveError::Storage(format!("failed to read {}: {e}", local_path.display()))
+    })?;
+    let mut writer = op
+        .writer_with(&storage_path)
+        .chunk(STREAM_CHUNK_BYTES)
+        .await
+        .map_err(|e| failed(&e))?;
+    loop {
+        let mut piece = Vec::with_capacity(STREAM_CHUNK_BYTES);
+        let read = (&mut file)
+            .take(STREAM_CHUNK_BYTES as u64)
+            .read_to_end(&mut piece)
+            .await
+            .map_err(|e| {
+                ResolveError::Storage(format!("failed to read {}: {e}", local_path.display()))
+            })?;
+        if read == 0 {
+            break;
+        }
+        if let Err(e) = writer.write(piece).await {
+            // Best effort: do not leave an unfinished multipart upload.
+            let _ = writer.abort().await;
+            return Err(failed(&e));
+        }
+    }
+    writer.close().await.map_err(|e| failed(&e))?;
+    tracing::debug!(model_id, path = storage_path, "uploaded external data file to storage");
+    Ok(())
 }
 
 /// Recursively upload files from a directory to storage.
+///
+/// Files listed in `skip` (paths relative to `base_dir`) are left out;
+/// the caller has uploaded them already.
 async fn upload_files_recursive(
     op: &Operator,
     model_id: &str,
     base_dir: &Path,
     current_dir: &Path,
+    skip: &[PathBuf],
 ) -> Result<(), ResolveError> {
     let mut entries = tokio::fs::read_dir(current_dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         if path.is_dir() {
-            Box::pin(upload_files_recursive(op, model_id, base_dir, &path)).await?;
+            Box::pin(upload_files_recursive(op, model_id, base_dir, &path, skip)).await?;
         } else {
             let relative = path
                 .strip_prefix(base_dir)
                 .map_err(|e| ResolveError::Storage(format!("path strip prefix failed: {e}")))?;
+            if skip.iter().any(|skipped| skipped == relative) {
+                continue;
+            }
             let filename = relative.to_string_lossy();
             let storage_path = format_storage_path(model_id, &filename);
 
@@ -892,5 +1102,265 @@ mod tests {
             list_files(&model_dir),
             vec!["config.json", "model.onnx", "tokenizer.json"]
         );
+    }
+
+    // --- ONNX external data ---
+
+    use crate::external_data::test_support::model_with_external_data;
+
+    /// Names of every object stored under `prefix`, sorted.
+    async fn stored_files(op: &Operator, prefix: &str) -> Vec<String> {
+        let mut names: Vec<String> = op
+            .list_with(prefix)
+            .recursive(true)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.metadata().is_file())
+            .map(|entry| entry.path().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn single_file_download_fetches_external_data() {
+        // Arrange -- the layout of an Optimum export above 2 GB.
+        let op = memory_operator();
+        let graph = model_with_external_data("model.onnx_data");
+        op.write("org/model/onnx/model.onnx", graph.clone()).await.unwrap();
+        op.write("org/model/onnx/model.onnx_data", b"weights".to_vec())
+            .await
+            .unwrap();
+        write_files(&op, "org/model", &["tokenizer.json", "config.json"]).await;
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let model_dir = download_model(&op, "org/model", cache_dir.path())
+            .await
+            .unwrap()
+            .expect("model should be found");
+
+        // Assert -- the data file sits next to its graph.
+        assert_eq!(
+            list_files(&model_dir),
+            vec![
+                "config.json",
+                "onnx/model.onnx",
+                "onnx/model.onnx_data",
+                "tokenizer.json",
+            ]
+        );
+        assert_eq!(fs::read(model_dir.join("onnx/model.onnx")).unwrap(), graph);
+        assert_eq!(
+            fs::read(model_dir.join("onnx/model.onnx_data")).unwrap(),
+            b"weights"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_file_download_misses_when_external_data_is_not_stored() {
+        // Arrange -- what a build without external data support uploaded:
+        // the graph alone.
+        let op = memory_operator();
+        op.write(
+            "org/model/onnx/model.onnx",
+            model_with_external_data("model.onnx_data"),
+        )
+        .await
+        .unwrap();
+        write_files(&op, "org/model", &["tokenizer.json", "config.json"]).await;
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let result = download_model(&op, "org/model", cache_dir.path()).await;
+
+        // Assert -- a miss, and nothing left behind in the local cache.
+        assert!(matches!(result, Ok(None)));
+        assert!(
+            !cache_dir
+                .path()
+                .join(STORAGE_CACHE_SUBDIR)
+                .join("org/model")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn encoder_decoder_download_fetches_external_data() {
+        // Arrange
+        let op = memory_operator();
+        write_files(
+            &op,
+            "org/model",
+            &["config.json", "tokenizer.json", "encoder_model.onnx"],
+        )
+        .await;
+        op.write(
+            "org/model/decoder_model.onnx",
+            model_with_external_data("decoder_model.onnx_data"),
+        )
+        .await
+        .unwrap();
+        op.write("org/model/decoder_model.onnx_data", b"weights".to_vec())
+            .await
+            .unwrap();
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let model_dir = download_encoder_decoder_model(&op, "org/model", cache_dir.path())
+            .await
+            .unwrap()
+            .expect("export should be found");
+
+        // Assert
+        assert_eq!(
+            list_files(&model_dir),
+            vec![
+                "config.json",
+                "decoder_model.onnx",
+                "decoder_model.onnx_data",
+                "encoder_model.onnx",
+                "tokenizer.json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn encoder_decoder_download_misses_when_external_data_is_not_stored() {
+        // Arrange
+        let op = memory_operator();
+        write_files(
+            &op,
+            "org/model",
+            &["config.json", "tokenizer.json", "encoder_model.onnx"],
+        )
+        .await;
+        op.write(
+            "org/model/decoder_model.onnx",
+            model_with_external_data("decoder_model.onnx_data"),
+        )
+        .await
+        .unwrap();
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let result = download_encoder_decoder_model(&op, "org/model", cache_dir.path()).await;
+
+        // Assert
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn incomplete_local_copy_is_downloaded_again() {
+        // Arrange -- storage is complete, but the local cache holds the
+        // graph without its data.
+        let op = memory_operator();
+        let graph = model_with_external_data("model.onnx_data");
+        op.write("org/model/model.onnx", graph.clone()).await.unwrap();
+        op.write("org/model/model.onnx_data", b"weights".to_vec())
+            .await
+            .unwrap();
+        write_files(&op, "org/model", &["tokenizer.json", "config.json"]).await;
+        let cache_dir = TempDir::new().unwrap();
+        let stale = cache_dir.path().join(STORAGE_CACHE_SUBDIR).join("org/model");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("model.onnx"), &graph).unwrap();
+
+        // Act
+        let model_dir = download_model(&op, "org/model", cache_dir.path())
+            .await
+            .unwrap()
+            .expect("model should be found");
+
+        // Assert
+        assert_eq!(model_dir, stale);
+        assert_eq!(fs::read(model_dir.join("model.onnx_data")).unwrap(), b"weights");
+    }
+
+    #[tokio::test]
+    async fn upload_model_uploads_external_data_with_its_graph() {
+        // Arrange -- a data file larger than one streamed piece would be
+        // too slow here; a few bytes take the same code path.
+        let op = memory_operator();
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("onnx")).unwrap();
+        let graph = model_with_external_data("model.onnx_data");
+        fs::write(dir.path().join("onnx/model.onnx"), &graph).unwrap();
+        fs::write(dir.path().join("onnx/model.onnx_data"), b"weights").unwrap();
+        fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
+        fs::write(dir.path().join("config.json"), b"{}").unwrap();
+
+        // Act
+        upload_model(&op, "org/model", dir.path())
+            .await
+            .expect("upload should succeed");
+
+        // Assert -- every file once, bytes intact.
+        assert_eq!(
+            stored_files(&op, "org/model/").await,
+            vec![
+                "org/model/config.json",
+                "org/model/onnx/model.onnx",
+                "org/model/onnx/model.onnx_data",
+                "org/model/tokenizer.json",
+            ]
+        );
+        assert_eq!(
+            op.read("org/model/onnx/model.onnx_data").await.unwrap().to_vec(),
+            b"weights"
+        );
+        assert_eq!(op.read("org/model/onnx/model.onnx").await.unwrap().to_vec(), graph);
+    }
+
+    #[tokio::test]
+    async fn upload_model_refuses_incomplete_model() {
+        // Arrange -- the graph without the data file it names: the state
+        // that reached storage in production.
+        let op = memory_operator();
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("onnx")).unwrap();
+        fs::write(
+            dir.path().join("onnx/model.onnx"),
+            model_with_external_data("model.onnx_data"),
+        )
+        .unwrap();
+        fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
+        fs::write(dir.path().join("config.json"), b"{}").unwrap();
+
+        // Act
+        let err = upload_model(&op, "org/model", dir.path())
+            .await
+            .expect_err("incomplete model must not be uploaded");
+
+        // Assert -- named in the error, and not one object written.
+        assert!(err.to_string().contains("onnx/model.onnx_data"), "unexpected error: {err}");
+        assert!(stored_files(&op, "org/model/").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn uploaded_model_with_external_data_downloads_complete() {
+        // Arrange -- upload, then fetch into an empty cache, as a second
+        // pod would.
+        let op = memory_operator();
+        let dir = TempDir::new().unwrap();
+        let graph = model_with_external_data("model.onnx_data");
+        let weights: Vec<u8> = (0..=255).cycle().take(100_000).collect();
+        fs::write(dir.path().join("model.onnx"), &graph).unwrap();
+        fs::write(dir.path().join("model.onnx_data"), &weights).unwrap();
+        fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
+        fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        upload_model(&op, "org/model", dir.path()).await.unwrap();
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let model_dir = download_model(&op, "org/model", cache_dir.path())
+            .await
+            .unwrap()
+            .expect("model should be found");
+
+        // Assert
+        assert_eq!(fs::read(model_dir.join("model.onnx")).unwrap(), graph);
+        assert_eq!(fs::read(model_dir.join("model.onnx_data")).unwrap(), weights);
     }
 }

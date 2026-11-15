@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::ResolveError;
+use crate::external_data;
 use crate::forge::{ForgeClient, StubForgeClient};
 use crate::hf;
 use crate::storage;
@@ -27,6 +28,10 @@ pub struct ModelResolver<F: ForgeClient = StubForgeClient> {
     operator: Option<opendal::Operator>,
     forge: F,
 }
+
+/// Directory under the Hugging Face home that holds, as regular files, the
+/// snapshots of models with ONNX external data.
+const HF_EXPORT_SUBDIR: &str = "hephaestus/hf-export";
 
 /// Validate that a model ID contains only allowed characters (T-03-01, T-03-04).
 ///
@@ -156,6 +161,7 @@ impl<F: ForgeClient> ModelResolver<F> {
 
         match hf_result {
             Ok(model_dir) => {
+                let model_dir = self.loadable_dir(model_id, model_dir).await?;
                 tracing::info!(
                     model_id,
                     tier = "huggingface",
@@ -180,6 +186,7 @@ impl<F: ForgeClient> ModelResolver<F> {
 
                 match export_result {
                     Ok(model_dir) => {
+                        let model_dir = self.loadable_dir(model_id, model_dir).await?;
                         tracing::info!(
                             model_id,
                             tier = "huggingface",
@@ -258,6 +265,51 @@ impl<F: ForgeClient> ModelResolver<F> {
                 Err(e)
             }
         }
+    }
+
+    /// Turn a Hugging Face snapshot into a directory ONNX Runtime can load.
+    ///
+    /// A snapshot is a directory of symbolic links into the cache's blob
+    /// store. That is fine for a graph that carries its own weights, and
+    /// such a model keeps resolving to its snapshot directory, exactly as
+    /// before. A graph with external data cannot be loaded through the
+    /// links (see [`external_data::materialize`]), so its snapshot is
+    /// rebuilt from hard links under [`HF_EXPORT_SUBDIR`] and that
+    /// directory is returned instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResolveError::HuggingFace`] if an external data file is
+    /// missing from the snapshot, and [`ResolveError::Io`] if the snapshot
+    /// cannot be inspected or rebuilt.
+    async fn loadable_dir(
+        &self,
+        model_id: &str,
+        snapshot_dir: PathBuf,
+    ) -> Result<PathBuf, ResolveError> {
+        let external = external_data::external_files_of_dir(snapshot_dir.clone()).await?;
+        if external.is_empty() {
+            return Ok(snapshot_dir);
+        }
+        if let Some(missing) = external.iter().find(|file| !file.present) {
+            return Err(ResolveError::HuggingFace(format!(
+                "external data file '{}' of model '{model_id}' was not downloaded (404)",
+                missing.relative_path.display(),
+            )));
+        }
+
+        let target = self.cache_dir.join(HF_EXPORT_SUBDIR).join(model_id);
+        let destination = target.clone();
+        tokio::task::spawn_blocking(move || external_data::materialize(&snapshot_dir, &destination))
+            .await
+            .map_err(std::io::Error::other)??;
+        tracing::info!(
+            model_id,
+            external_data_files = external.len(),
+            path = %target.display(),
+            "model has ONNX external data; rebuilt its snapshot out of regular files"
+        );
+        Ok(target)
     }
 
     /// Spawn a background task to upload model files to storage.
