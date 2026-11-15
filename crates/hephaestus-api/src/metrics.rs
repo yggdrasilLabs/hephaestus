@@ -37,6 +37,10 @@ pub fn install_recorder() -> Result<PrometheusHandle, anyhow::Error> {
 /// Wraps the `metrics` crate so that pipeline stages and handlers never
 /// interact with metrics macros directly. All histograms and counters
 /// carry a `model_id` label per D-10.
+///
+/// Cloning is cheap (a shared `model_id`), so a stage that runs on another
+/// thread can take its own copy.
+#[derive(Clone)]
 pub struct StageTimer {
     model_id: Arc<str>,
 }

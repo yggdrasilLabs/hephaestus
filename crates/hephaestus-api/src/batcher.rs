@@ -92,7 +92,8 @@ impl Batcher {
 ///
 /// Waits for the first request, then collects additional requests
 /// until either `max_batch_size` is reached or `max_wait` elapses.
-/// Write-locks the pipeline RwLock only during `execute_batch` -- never
+/// Write-locks the pipeline RwLock only during `execute_batch`, which runs
+/// on a blocking thread ([`AppState::run_inference`]) -- never
 /// during the collection phase per [`rules/anti-lock-across-await.md`].
 ///
 /// On any `execute_batch` failure, the error is sent to ALL pending
@@ -144,16 +145,25 @@ pub async fn batcher_loop(
             replies.push(req.reply);
         }
 
-        // Write-lock pipeline only during execute_batch (not during collection).
-        let results = {
-            let mut pipeline_guard = state.write_pipeline().await;
-            pipeline_guard.execute_batch(inputs)
-        };
-        // Pipeline write lock released here.
+        // Write-lock pipeline only during execute_batch (not during
+        // collection). The batch runs on a blocking thread, which holds the
+        // lock until it finishes.
+        let results = state
+            .run_inference(move |pipeline| pipeline.execute_batch(inputs))
+            .await;
 
         // Fan results back to individual requests.
-        for (reply, result) in replies.into_iter().zip(results) {
-            let _ = reply.send(result);
+        match results {
+            Ok(results) => {
+                for (reply, result) in replies.into_iter().zip(results) {
+                    let _ = reply.send(result);
+                }
+            }
+            Err(e) => {
+                for reply in replies {
+                    let _ = reply.send(Err(CoreError::Inference(e.to_string())));
+                }
+            }
         }
     }
 }

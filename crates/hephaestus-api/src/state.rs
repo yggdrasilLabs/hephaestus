@@ -4,6 +4,7 @@
 //! runtime metadata. It is wrapped in [`Arc`] and passed to every
 //! axum handler via the [`State`](axum::extract::State) extractor.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::sync::RwLock;
 
 use crate::batcher::Batcher;
+use crate::error::ApiError;
 
 /// Shared application state for all HTTP handlers.
 ///
@@ -26,7 +28,10 @@ pub struct AppState {
     /// Write lock: [`PipelineKind::execute`] requires `&mut self` (ONNX session).
     /// This allows concurrent tokenization across requests while serializing
     /// inference (SC-02).
-    pipeline: RwLock<PipelineKind>,
+    ///
+    /// Behind an [`Arc`] so [`AppState::run_inference`] can move an owned
+    /// write guard onto a blocking thread.
+    pipeline: Arc<RwLock<PipelineKind>>,
 
     /// Readiness flag. Starts `false`; flipped to `true` after the
     /// warmup inference pass succeeds (D-05). On SIGTERM, flipped
@@ -54,6 +59,11 @@ pub struct AppState {
 
     /// Overlap duration in seconds between consecutive audio windows (D-10).
     overlap_secs: f32,
+
+    /// Test seam: runs on the blocking thread, under the write lock, just
+    /// before the inference closure. Lets a test stand in for a slow model.
+    #[cfg(test)]
+    before_inference: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl AppState {
@@ -71,7 +81,7 @@ impl AppState {
         overlap_secs: f32,
     ) -> Self {
         Self {
-            pipeline: RwLock::new(pipeline),
+            pipeline: Arc::new(RwLock::new(pipeline)),
             ready: AtomicBool::new(false),
             model_id,
             start_time: Instant::now(),
@@ -80,7 +90,15 @@ impl AppState {
             batcher,
             window_size_secs,
             overlap_secs,
+            #[cfg(test)]
+            before_inference: None,
         }
+    }
+
+    /// Install the test seam that runs before every inference closure.
+    #[cfg(test)]
+    pub(crate) fn set_before_inference(&mut self, hook: impl Fn() + Send + Sync + 'static) {
+        self.before_inference = Some(Arc::new(hook));
     }
 
     /// Check whether the service is ready to accept inference requests.
@@ -124,11 +142,52 @@ impl AppState {
 
     /// Acquire an exclusive write lock on the inference pipeline.
     ///
-    /// Used for [`PipelineKind::execute`] and [`PipelineKind::execute_batch`]
-    /// which take `&mut self` (ONNX session mutation). Only one writer at a
-    /// time; blocks all readers while held.
+    /// Only for short work done before the server takes requests (warmup).
+    /// The guard is held on the calling task, so running a model under it
+    /// blocks a runtime worker thread; request paths use
+    /// [`AppState::run_inference`] instead.
     pub async fn write_pipeline(&self) -> tokio::sync::RwLockWriteGuard<'_, PipelineKind> {
         self.pipeline.write().await
+    }
+
+    /// Run model inference under the pipeline write lock, off the runtime.
+    ///
+    /// Waits for the write lock without blocking, then runs `f` on tokio's
+    /// blocking thread pool, so a long generation never occupies a runtime
+    /// worker thread and probes, metrics and other requests keep being
+    /// served. Used for [`PipelineKind::execute`] and
+    /// [`PipelineKind::execute_batch`], which take `&mut self`.
+    ///
+    /// The blocking thread owns the write guard. If the caller stops
+    /// waiting (request timeout, client gone), `f` still runs to its end
+    /// and only then releases the lock, so there is never more than one
+    /// inference on the pipeline at a time.
+    ///
+    /// `f` runs inside the caller's tracing span.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Internal`] if the blocking task panicked or the
+    /// runtime shut down before it ran.
+    pub async fn run_inference<R, F>(&self, f: F) -> Result<R, ApiError>
+    where
+        F: FnOnce(&mut PipelineKind) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let mut pipeline = Arc::clone(&self.pipeline).write_owned().await;
+        let span = tracing::Span::current();
+        #[cfg(test)]
+        let before_inference = self.before_inference.clone();
+        tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
+            #[cfg(test)]
+            if let Some(hook) = before_inference {
+                hook();
+            }
+            f(&mut pipeline)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("inference task failed: {e}")))
     }
 
     /// Check whether dynamic batching is enabled.

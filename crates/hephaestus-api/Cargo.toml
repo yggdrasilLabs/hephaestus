@@ -32,3 +32,4 @@ scylla-client.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = { workspace = true, features = ["util"] }
+tempfile.workspace = true

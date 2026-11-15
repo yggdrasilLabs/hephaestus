@@ -81,10 +81,15 @@ impl InferenceService for GrpcInferenceService {
                     let pipeline = self.state.read_pipeline().await;
                     timer.time("tokenization", || pipeline.prepare(req.text))?
                 }; // Read lock dropped here.
-                let pipeline_output = {
-                    let mut pipeline = self.state.write_pipeline().await;
-                    timer.time("inference", || pipeline.execute(prepared))?
-                }; // Write lock dropped here.
+                // The model runs on a blocking thread, which holds the
+                // write lock until it finishes, so this task only waits.
+                let stage_timer = timer.clone();
+                let pipeline_output = self
+                    .state
+                    .run_inference(move |pipeline| {
+                        stage_timer.time("inference", || pipeline.execute(prepared))
+                    })
+                    .await??;
                 Ok::<_, ApiError>(pipeline_output.to_json())
             }
         })

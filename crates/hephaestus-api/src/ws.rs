@@ -401,11 +401,10 @@ async fn run_asr_inference(
         pipeline.prepare(InferenceInput::Audio(samples))?
     };
 
-    // Write lock for execute (ONNX session mutation).
-    let output = {
-        let mut pipeline = state.write_pipeline().await;
-        pipeline.execute(prepared)?
-    };
+    // Write lock for execute (ONNX session mutation), on a blocking thread.
+    let output = state
+        .run_inference(move |pipeline| pipeline.execute(prepared))
+        .await??;
 
     match output {
         PipelineOutput::Asr(text) => Ok(text),

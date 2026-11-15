@@ -126,10 +126,14 @@ pub async fn infer(
                 let input = request_input(&pipeline, req.text, req.system)?;
                 timer.time("tokenization", || pipeline.prepare(input))?
             }; // Read lock dropped here.
-            let pipeline_output = {
-                let mut pipeline = state.write_pipeline().await;
-                timer.time("inference", || pipeline.execute(prepared))?
-            }; // Write lock dropped here.
+            // The model runs on a blocking thread, which holds the write
+            // lock until it finishes, so this task only waits.
+            let stage_timer = timer.clone();
+            let pipeline_output = state
+                .run_inference(move |pipeline| {
+                    stage_timer.time("inference", || pipeline.execute(prepared))
+                })
+                .await??;
             Ok::<_, ApiError>(pipeline_output.to_json())
         }
     })
@@ -230,7 +234,184 @@ pub async fn readiness(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use hephaestus_core::{ExecutionProvider, Seq2SeqPipeline};
+    use tower::ServiceExt;
+
     use super::*;
+
+    /// State around a real (tiny) encoder-decoder pipeline, built from the
+    /// fixture graphs of `hephaestus-core`. `before_inference` runs on the
+    /// inference thread before each run, to stand in for a slow model.
+    fn fixture_state(
+        request_timeout: Duration,
+        before_inference: impl Fn() + Send + Sync + 'static,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../hephaestus-core/tests/fixtures/seq2seq");
+        let dir = tempfile::tempdir().expect("temp dir");
+        for file in ["tokenizer.json", "encoder_model.onnx", "decoder_model.onnx"] {
+            std::fs::copy(fixtures.join(file), dir.path().join(file)).expect("copy fixture");
+        }
+        let config = serde_json::json!({
+            "architectures": ["BartForConditionalGeneration"],
+            "bos_token_id": 0,
+            "decoder_start_token_id": 2,
+            "eos_token_id": 2,
+            "max_length": 32,
+            "max_position_embeddings": 64,
+            "pad_token_id": 1,
+            "vocab_size": 16
+        });
+        std::fs::write(dir.path().join("config.json"), config.to_string()).expect("write config");
+        let pipeline = Seq2SeqPipeline::new(dir.path(), &ExecutionProvider::Cpu)
+            .expect("pipeline should load");
+
+        // A recorder that is not installed globally: only its handle is needed.
+        let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        let mut state = AppState::new(
+            PipelineKind::Seq2Seq(pipeline),
+            "fixture/seq2seq".to_string(),
+            request_timeout,
+            metrics_handle,
+            None,
+            30.0,
+            5.0,
+        );
+        state.set_before_inference(before_inference);
+        state.set_ready(true);
+        (Arc::new(state), dir)
+    }
+
+    fn infer_request(text: &str) -> Request<Body> {
+        Request::post("/infer")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({ "text": text }).to_string()))
+            .expect("request should build")
+    }
+
+    fn get(path: &str) -> Request<Body> {
+        Request::get(path)
+            .body(Body::empty())
+            .expect("request should build")
+    }
+
+    // A single-threaded runtime: if inference ran on the runtime thread,
+    // nothing else could be polled until it finished.
+    #[tokio::test(flavor = "current_thread")]
+    async fn probes_and_metrics_answer_while_inference_is_running() {
+        // Arrange -- every inference takes at least a second.
+        const INFERENCE_TIME: Duration = Duration::from_secs(1);
+        let started = Arc::new(AtomicBool::new(false));
+        let hook_started = Arc::clone(&started);
+        let (state, _dir) = fixture_state(Duration::from_secs(30), move || {
+            hook_started.store(true, Ordering::SeqCst);
+            std::thread::sleep(INFERENCE_TIME);
+        });
+        let app = crate::build_router(state);
+
+        // Act -- start a generation, wait until the model is running, then
+        // call the probes and metrics on the same runtime.
+        let infer = tokio::spawn(app.clone().oneshot(infer_request("a b c")));
+        while !started.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let asked = Instant::now();
+        let mut statuses = Vec::new();
+        for path in ["/healthz/live", "/healthz/ready", "/metrics"] {
+            let response = app.clone().oneshot(get(path)).await.expect("infallible");
+            statuses.push(response.status());
+        }
+        let answered_in = asked.elapsed();
+        let still_running = !infer.is_finished();
+
+        // Assert -- all three answered at once, during the generation.
+        assert_eq!(statuses, [StatusCode::OK; 3]);
+        assert!(
+            still_running,
+            "probes were only served after inference finished"
+        );
+        assert!(
+            answered_in < INFERENCE_TIME / 4,
+            "probes took {answered_in:?} during inference"
+        );
+
+        // The generation itself is unaffected.
+        let response = infer.await.expect("task should join").expect("infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body["generated_text"], "a b c");
+        assert_eq!(body["model_id"], "fixture/seq2seq");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timed_out_request_keeps_the_pipeline_locked_until_its_inference_ends() {
+        // Arrange -- inference outlasts the request timeout; the hook
+        // counts how many inferences run at the same moment.
+        let running = Arc::new(AtomicUsize::new(0));
+        let most_at_once = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (hook_running, hook_most, hook_runs) = (
+            Arc::clone(&running),
+            Arc::clone(&most_at_once),
+            Arc::clone(&runs),
+        );
+        let (state, _dir) = fixture_state(Duration::from_millis(100), move || {
+            let now = hook_running.fetch_add(1, Ordering::SeqCst) + 1;
+            hook_most.fetch_max(now, Ordering::SeqCst);
+            hook_runs.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(400));
+            hook_running.fetch_sub(1, Ordering::SeqCst);
+        });
+        let app = crate::build_router(Arc::clone(&state));
+
+        // Act -- the request gives up after 100 ms; its inference goes on.
+        let asked = Instant::now();
+        let response = app
+            .oneshot(infer_request("a b c"))
+            .await
+            .expect("infallible");
+        let timed_out_after = asked.elapsed();
+        let abandoned_still_running = running.load(Ordering::SeqCst) == 1;
+        // A second inference, with no timeout of its own, must wait for it.
+        let prepared = state
+            .read_pipeline()
+            .await
+            .prepare("d e f".to_string())
+            .expect("prepare should succeed");
+        let output = state
+            .run_inference(move |pipeline| pipeline.execute(prepared))
+            .await
+            .expect("inference task should finish")
+            .expect("execute should succeed");
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            timed_out_after < Duration::from_millis(350),
+            "504 after {timed_out_after:?}"
+        );
+        assert!(
+            abandoned_still_running,
+            "abandoned inference should still be running"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "both inferences ran");
+        assert_eq!(most_at_once.load(Ordering::SeqCst), 1, "never two at once");
+        assert_eq!(
+            output.to_json(),
+            serde_json::json!({ "generated_text": "d e f" })
+        );
+    }
 
     #[test]
     fn infer_request_deserializes_from_json() {
