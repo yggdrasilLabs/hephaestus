@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use hf_hub::{HFClient, HFError};
 
 use crate::encoder_decoder::{
-    DECODER_ONNX_CANDIDATES, ENCODER_ONNX, GENERATION_CONFIG_JSON, ONNX_SUBDIR_PREFIX,
-    is_whisper_config,
+    DECODER_ONNX_CANDIDATES, ENCODER_ONNX, GENERATION_CONFIG_JSON, MERGED_DECODER_ONNX,
+    ONNX_SUBDIR_PREFIX, is_whisper_config,
 };
 use crate::error::ResolveError;
 
@@ -155,8 +155,10 @@ pub(crate) async fn download_encoder_decoder_from_hf(
 ///    resolution stays as it was before this lookup existed.
 /// 2. `encoder_model.onnx`, under `onnx/` first and then at the repository
 ///    root (the order [`download_from_hf`] uses).
-/// 3. One decoder next to the encoder: `decoder_model.onnx`, else
-///    `decoder_model_merged.onnx`.
+/// 3. A decoder next to the encoder: `decoder_model.onnx`, else
+///    `decoder_model_merged.onnx`. After `decoder_model.onnx`, the merged
+///    decoder is requested too; it is optional, so a miss or a failure
+///    there does not stop the lookup.
 /// 4. `tokenizer.json` (required) and `generation_config.json` (optional).
 ///
 /// Returns the snapshot root directory, or [`ResolveError::NoOnnxExport`]
@@ -193,6 +195,11 @@ where
         for decoder in DECODER_ONNX_CANDIDATES {
             if fetch(format!("{prefix}{decoder}")).await?.is_some() {
                 has_decoder = true;
+                if decoder != MERGED_DECODER_ONNX
+                    && let Err(e) = fetch(format!("{prefix}{MERGED_DECODER_ONNX}")).await
+                {
+                    tracing::warn!(model_id, error = %e, "failed to download optional merged decoder");
+                }
                 break;
             }
         }
@@ -315,7 +322,7 @@ mod tests {
         // Act
         let root = repo.resolve().await.expect("export should resolve");
 
-        // Assert -- one decoder fetched, and it is the plain one.
+        // Assert -- the plain decoder, then the merged one next to it.
         assert_eq!(root, repo.root.path());
         assert_eq!(
             repo.requested(),
@@ -323,6 +330,7 @@ mod tests {
                 "config.json",
                 "onnx/encoder_model.onnx",
                 "onnx/decoder_model.onnx",
+                "onnx/decoder_model_merged.onnx",
                 "tokenizer.json",
                 "generation_config.json",
             ]
@@ -356,6 +364,61 @@ mod tests {
                 "generation_config.json",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn export_without_merged_decoder_still_resolves() {
+        // Arrange -- plain decoder only.
+        let repo = FakeRepo::with_files(&[
+            "config.json",
+            "tokenizer.json",
+            "onnx/encoder_model.onnx",
+            "onnx/decoder_model.onnx",
+        ]);
+
+        // Act
+        let root = repo.resolve().await.expect("export should resolve");
+
+        // Assert -- the merged decoder is asked for once and may be absent.
+        assert_eq!(root, repo.root.path());
+        assert_eq!(
+            repo.requested(),
+            vec![
+                "config.json",
+                "onnx/encoder_model.onnx",
+                "onnx/decoder_model.onnx",
+                "onnx/decoder_model_merged.onnx",
+                "tokenizer.json",
+                "generation_config.json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_merged_decoder_download_does_not_fail_the_export() {
+        // Arrange -- every request for the merged decoder errors.
+        let repo = FakeRepo::with_files(&[
+            "config.json",
+            "tokenizer.json",
+            "onnx/encoder_model.onnx",
+            "onnx/decoder_model.onnx",
+        ]);
+
+        // Act
+        let result = fetch_encoder_decoder_export("org/model", |filename| {
+            let root = repo.root.path().to_path_buf();
+            async move {
+                if filename.ends_with(MERGED_DECODER_ONNX) {
+                    return Err(ResolveError::HuggingFace("connection reset".to_string()));
+                }
+                let path = root.join(&filename);
+                Ok(path.exists().then_some(path))
+            }
+        })
+        .await;
+
+        // Assert
+        assert_eq!(result.expect("export should resolve"), repo.root.path());
     }
 
     #[tokio::test]

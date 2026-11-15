@@ -10,13 +10,16 @@
 /// Encoder graph of an encoder-decoder export.
 pub(crate) const ENCODER_ONNX: &str = "encoder_model.onnx";
 
-/// Decoder graphs in order of preference.
+/// Decoder graphs in lookup order; an export needs at least one of them.
 ///
-/// The runtime decodes without a key/value cache, so the plain decoder is
-/// the graph it needs; the merged decoder is used when it is the only one
-/// published. Exactly one of them is fetched.
-pub(crate) const DECODER_ONNX_CANDIDATES: [&str; 2] =
-    ["decoder_model.onnx", "decoder_model_merged.onnx"];
+/// The first one found is fetched and makes the export usable. When that
+/// is the plain decoder, [`MERGED_DECODER_ONNX`] is fetched as well if the
+/// export has it.
+pub(crate) const DECODER_ONNX_CANDIDATES: [&str; 2] = ["decoder_model.onnx", MERGED_DECODER_ONNX];
+
+/// Merged decoder graph: the one the runtime decodes with a key/value
+/// cache. Optional next to the plain decoder, which runs without a cache.
+pub(crate) const MERGED_DECODER_ONNX: &str = "decoder_model_merged.onnx";
 
 /// Generation settings file. Optional: the settings may live in `config.json`.
 pub(crate) const GENERATION_CONFIG_JSON: &str = "generation_config.json";

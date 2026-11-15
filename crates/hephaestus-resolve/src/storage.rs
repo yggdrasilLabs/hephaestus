@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use opendal::{ErrorKind, Operator};
 
 use crate::encoder_decoder::{
-    DECODER_ONNX_CANDIDATES, ENCODER_ONNX, GENERATION_CONFIG_JSON, ONNX_SUBDIR_PREFIX,
-    is_whisper_config,
+    DECODER_ONNX_CANDIDATES, ENCODER_ONNX, GENERATION_CONFIG_JSON, MERGED_DECODER_ONNX,
+    ONNX_SUBDIR_PREFIX, is_whisper_config,
 };
 use crate::error::ResolveError;
 
@@ -194,9 +194,14 @@ pub(crate) async fn download_encoder_decoder_model(
             continue;
         }
         for decoder in DECODER_ONNX_CANDIDATES {
-            let decoder = format!("{prefix}{decoder}");
-            if download_file_into(op, model_id, &decoder, temp_dir.path()).await? {
+            let path = format!("{prefix}{decoder}");
+            if download_file_into(op, model_id, &path, temp_dir.path()).await? {
                 found = true;
+                if decoder != MERGED_DECODER_ONNX {
+                    // Optional: the graph for cached decoding.
+                    let merged = format!("{prefix}{MERGED_DECODER_ONNX}");
+                    download_file_into(op, model_id, &merged, temp_dir.path()).await?;
+                }
                 break;
             }
         }
@@ -601,12 +606,13 @@ mod tests {
             .unwrap()
             .expect("export should be found");
 
-        // Assert -- one decoder, the plain one; nothing the runtime does not read.
+        // Assert -- both decoders the runtime can use; nothing it does not read.
         assert_eq!(
             list_files(&model_dir),
             vec![
                 "config.json",
                 "decoder_model.onnx",
+                "decoder_model_merged.onnx",
                 "encoder_model.onnx",
                 "generation_config.json",
                 "tokenizer.json",
@@ -615,6 +621,82 @@ mod tests {
         assert_eq!(
             fs::read(model_dir.join("decoder_model.onnx")).unwrap(),
             b"decoder_model.onnx"
+        );
+    }
+
+    #[tokio::test]
+    async fn encoder_decoder_download_fetches_merged_decoder_from_onnx_subdirectory() {
+        // Arrange
+        let op = memory_operator();
+        write_files(
+            &op,
+            "org/model",
+            &[
+                "onnx/encoder_model.onnx",
+                "onnx/decoder_model.onnx",
+                "onnx/decoder_model_merged.onnx",
+                "tokenizer.json",
+                "config.json",
+            ],
+        )
+        .await;
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let model_dir = download_encoder_decoder_model(&op, "org/model", cache_dir.path())
+            .await
+            .unwrap()
+            .expect("export should be found");
+
+        // Assert -- the merged decoder lands next to the encoder.
+        assert_eq!(
+            list_files(&model_dir),
+            vec![
+                "config.json",
+                "onnx/decoder_model.onnx",
+                "onnx/decoder_model_merged.onnx",
+                "onnx/encoder_model.onnx",
+                "tokenizer.json",
+            ]
+        );
+        assert_eq!(
+            fs::read(model_dir.join("onnx/decoder_model_merged.onnx")).unwrap(),
+            b"onnx/decoder_model_merged.onnx"
+        );
+    }
+
+    #[tokio::test]
+    async fn encoder_decoder_download_without_merged_decoder_is_unchanged() {
+        // Arrange -- an export uploaded before the merged decoder was fetched.
+        let op = memory_operator();
+        write_files(
+            &op,
+            "org/model",
+            &[
+                "encoder_model.onnx",
+                "decoder_model.onnx",
+                "tokenizer.json",
+                "config.json",
+            ],
+        )
+        .await;
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let model_dir = download_encoder_decoder_model(&op, "org/model", cache_dir.path())
+            .await
+            .unwrap()
+            .expect("export should be found");
+
+        // Assert
+        assert_eq!(
+            list_files(&model_dir),
+            vec![
+                "config.json",
+                "decoder_model.onnx",
+                "encoder_model.onnx",
+                "tokenizer.json",
+            ]
         );
     }
 

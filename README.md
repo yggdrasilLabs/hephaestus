@@ -180,7 +180,7 @@ Rules:
 
 - `model.onnx` always wins. A directory that holds both layouts runs as a fused model, exactly as before the encoder-decoder layout existed.
 - `decoder_model_merged.onnx` is preferred when present and runs with a key/value cache: the first step runs its uncached branch, every later step feeds only the newest token plus the cached tensors. Without that file, `decoder_model.onnx` runs without a cache, as before. If both files exist and the merged one cannot be loaded or cannot feed its cache back, a warning is logged and `decoder_model.onnx` runs. `decoder_with_past_model.onnx` is never used.
-- The model resolver (storage and Hugging Face tiers) still downloads one decoder, `decoder_model.onnx` first. A resolved model therefore gets the cache only when `decoder_model_merged.onnx` is the only decoder published; a directory given through `MODEL_PATH` gets it whenever the file is there.
+- The model resolver (storage and Hugging Face tiers) downloads `decoder_model.onnx` and, when the export has it, `decoder_model_merged.onnx` as well. Models already in the local cache directory are not re-fetched.
 - Only one decoder graph is loaded. The startup log line `seq2seq encoder-decoder mode loaded` reports the file and `kv_cache`.
 - There is no environment variable to switch the cache off; remove `decoder_model_merged.onnx` from the model directory to get the uncached loop (library users: `Seq2SeqOptions::with_kv_cache(false)`).
 - Both layouts also need `tokenizer.json` and `config.json`. `generation_config.json` is read when present.
