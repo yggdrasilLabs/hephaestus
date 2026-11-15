@@ -23,6 +23,23 @@ expected output of every test can be worked out by hand:
     ``use_cache_branch = true`` or a non-zero cache shifts every token by
     one, so a wrong feed fails the tests.
 
+``decoder_model_merged_cached.onnx``
+    A merged decoder that follows the Optimum key/value cache convention,
+    with one decoder and one encoder cache tensor. Tests copy it into a
+    model directory as ``decoder_model_merged.onnx``.
+
+    * ``use_cache_branch = false``: the same echo, read from
+      ``encoder_hidden_states``; a non-zero dummy cache shifts every token
+      by one. Returns ``present.0.decoder.key`` = the decoder tokens and
+      ``present.0.encoder.key`` = the encoder tokens.
+    * ``use_cache_branch = true``: the echo is read from
+      ``past_key_values.0.encoder.key`` at the positions that follow the
+      ``past_key_values.0.decoder.key`` length, so it only comes out right
+      when the newest token alone is fed, the decoder cache grows by one
+      each step and the encoder cache of the first step is fed back.
+      Returns the grown decoder cache and, as Optimum does, an *empty*
+      ``present.0.encoder.key``.
+
 ``model.onnx``
     A fused single-pass model: ``output_ids = input_ids * attention_mask + 1``.
     Its output differs from the echo, so tests can tell which mode ran.
@@ -149,6 +166,98 @@ def make_merged_decoder() -> None:
     _save(graph, "decoder_model_merged.onnx")
 
 
+def make_cached_merged_decoder() -> None:
+    float4 = [1, 1, -1, 1]
+    cache_shape = ["batch", 1, "cache_seq", 1]
+
+    def branch_outputs() -> list[onnx.ValueInfoProto]:
+        return [
+            helper.make_tensor_value_info("b_logits", TensorProto.FLOAT, ["batch", "new_seq", VOCAB_SIZE]),
+            helper.make_tensor_value_info("b_present_decoder", TensorProto.FLOAT, cache_shape),
+            helper.make_tensor_value_info("b_present_encoder", TensorProto.FLOAT, cache_shape),
+        ]
+
+    # Uncached branch: echo from the encoder hidden states.
+    no_cache = helper.make_graph(
+        [
+            helper.make_node("ReduceSum", ["past_key_values.0.decoder.key"], ["past_dec_sum"], keepdims=0),
+            helper.make_node("ReduceSum", ["past_key_values.0.encoder.key"], ["past_enc_sum"], keepdims=0),
+            helper.make_node("Add", ["past_dec_sum", "past_enc_sum"], ["past_sum"]),
+            helper.make_node("Cast", ["past_sum"], ["past_shift"], to=TensorProto.INT64),
+            helper.make_node("Add", ["echo", "past_shift"], ["shifted"]),
+            helper.make_node("OneHot", ["shifted", "depth", "off_on"], ["b_logits"], axis=-1),
+            helper.make_node("Reshape", ["ids_f", "float4"], ["b_present_decoder"]),
+            helper.make_node("Cast", ["enc"], ["enc_tokens_f"], to=TensorProto.FLOAT),
+            helper.make_node("Reshape", ["enc_tokens_f", "float4"], ["b_present_encoder"]),
+        ],
+        "no_cache_branch",
+        [],
+        branch_outputs(),
+    )
+
+    # Cached branch: echo from the cached encoder tokens, at the positions
+    # after the cached decoder tokens.
+    with_cache = helper.make_graph(
+        [
+            helper.make_node("Shape", ["past_key_values.0.decoder.key"], ["past_shape"]),
+            helper.make_node("Gather", ["past_shape", "two"], ["past_len"], axis=0),
+            helper.make_node("Add", ["past_len", "one"], ["first"]),
+            helper.make_node("Add", ["first", "dec_len"], ["end"]),
+            helper.make_node("Range", ["first", "end", "one"], ["c_positions"]),
+            helper.make_node("Reshape", ["past_key_values.0.encoder.key", "rows"], ["cached_enc_f"]),
+            helper.make_node("Cast", ["cached_enc_f"], ["cached_enc"], to=TensorProto.INT64),
+            helper.make_node("Shape", ["cached_enc"], ["cached_enc_shape"]),
+            helper.make_node("Gather", ["cached_enc_shape", "one"], ["cached_enc_len"], axis=0),
+            helper.make_node("Sub", ["cached_enc_len", "one"], ["c_last"]),
+            helper.make_node("Min", ["c_positions", "c_last"], ["c_clamped"]),
+            helper.make_node("Gather", ["cached_enc", "c_clamped"], ["c_echo"], axis=1),
+            helper.make_node("OneHot", ["c_echo", "depth", "off_on"], ["b_logits"], axis=-1),
+            helper.make_node("Reshape", ["ids_f", "float4"], ["ids_4"]),
+            helper.make_node(
+                "Concat", ["past_key_values.0.decoder.key", "ids_4"], ["b_present_decoder"], axis=2
+            ),
+            helper.make_node(
+                "Constant",
+                [],
+                ["b_present_encoder"],
+                value=helper.make_tensor("empty", TensorProto.FLOAT, [0, 1, 1, 1], []),
+            ),
+        ],
+        "with_cache_branch",
+        [],
+        branch_outputs(),
+    )
+
+    nodes = _echo_nodes() + [
+        helper.make_node("Cast", ["input_ids"], ["ids_f"], to=TensorProto.FLOAT),
+        helper.make_node(
+            "If",
+            ["use_cache_branch_scalar"],
+            ["logits", "present.0.decoder.key", "present.0.encoder.key"],
+            then_branch=with_cache,
+            else_branch=no_cache,
+        ),
+    ]
+    nodes.insert(0, helper.make_node("Squeeze", ["use_cache_branch"], ["use_cache_branch_scalar"]))
+    inputs = _decoder_inputs() + [
+        helper.make_tensor_value_info("use_cache_branch", TensorProto.BOOL, [1]),
+        helper.make_tensor_value_info("past_key_values.0.decoder.key", TensorProto.FLOAT, ["batch", 1, "past_seq", 1]),
+        helper.make_tensor_value_info("past_key_values.0.encoder.key", TensorProto.FLOAT, ["batch", 1, "enc_seq", 1]),
+    ]
+    outputs = [
+        helper.make_tensor_value_info("logits", TensorProto.FLOAT, ["batch", "dec_seq", VOCAB_SIZE]),
+        helper.make_tensor_value_info("present.0.decoder.key", TensorProto.FLOAT, ["batch", 1, "present_seq", 1]),
+        helper.make_tensor_value_info("present.0.encoder.key", TensorProto.FLOAT, ["batch", 1, "enc_seq", 1]),
+    ]
+    initializers = _echo_initializers() + [
+        helper.make_tensor("two", TensorProto.INT64, [], [2]),
+        helper.make_tensor("float4", TensorProto.INT64, [4], float4),
+        helper.make_tensor("rows", TensorProto.INT64, [2], [1, -1]),
+    ]
+    graph = helper.make_graph(nodes, "tiny_cached_merged_decoder", inputs, outputs, initializer=initializers)
+    _save(graph, "decoder_model_merged_cached.onnx")
+
+
 def make_fused() -> None:
     nodes = [
         helper.make_node("Mul", ["input_ids", "attention_mask"], ["masked"]),
@@ -187,6 +296,7 @@ if __name__ == "__main__":
     make_encoder()
     make_decoder()
     make_merged_decoder()
+    make_cached_merged_decoder()
     make_fused()
     make_tokenizer()
     print("fixtures written to", HERE)

@@ -174,16 +174,19 @@ The seq2seq profile serves two ONNX layouts through the same `/infer` request an
 | Layout | Files (in the model directory or its `onnx/` subdirectory) | How it runs |
 |--------|-------------------------------------------------------------|-------------|
 | **Fused** | `model.onnx` | One forward pass. The graph returns the output token IDs (or logits). |
-| **Encoder-decoder** (standard Optimum export) | `encoder_model.onnx` plus `decoder_model.onnx` or `decoder_model_merged.onnx` | The encoder runs once, then the decoder runs once per generated token. |
+| **Encoder-decoder** (standard Optimum export) | `encoder_model.onnx` plus `decoder_model_merged.onnx` and/or `decoder_model.onnx` | The encoder runs once, then the decoder runs once per generated token, with a key/value cache when `decoder_model_merged.onnx` is there. |
 
 Rules:
 
 - `model.onnx` always wins. A directory that holds both layouts runs as a fused model, exactly as before the encoder-decoder layout existed.
-- `decoder_model.onnx` is preferred over `decoder_model_merged.onnx`. The merged graph is used only when it is the only decoder, with its cache branch switched off. `decoder_with_past_model.onnx` is never used.
+- `decoder_model_merged.onnx` is preferred when present and runs with a key/value cache: the first step runs its uncached branch, every later step feeds only the newest token plus the cached tensors. Without that file, `decoder_model.onnx` runs without a cache, as before. If both files exist and the merged one cannot be loaded or cannot feed its cache back, a warning is logged and `decoder_model.onnx` runs. `decoder_with_past_model.onnx` is never used.
+- The model resolver (storage and Hugging Face tiers) still downloads one decoder, `decoder_model.onnx` first. A resolved model therefore gets the cache only when `decoder_model_merged.onnx` is the only decoder published; a directory given through `MODEL_PATH` gets it whenever the file is there.
+- Only one decoder graph is loaded. The startup log line `seq2seq encoder-decoder mode loaded` reports the file and `kv_cache`.
+- There is no environment variable to switch the cache off; remove `decoder_model_merged.onnx` from the model directory to get the uncached loop (library users: `Seq2SeqOptions::with_kv_cache(false)`).
 - Both layouts also need `tokenizer.json` and `config.json`. `generation_config.json` is read when present.
 - Whisper models are not handled here; they stay on the `asr` profile.
 
-Encoder-decoder generation is greedy (one candidate, most likely token each step) and does not reuse decoder state between steps, so every step re-reads the whole output so far. Cost grows with the square of the output length. Each replica generates one summary at a time; with `BATCH_ENABLED=true` the items of a batch run one after another and each caller gets its own result.
+Encoder-decoder generation is greedy (one candidate, most likely token each step). With the cache each step costs about the same; without it every step re-reads the whole output so far, and cost grows with the square of the output length. Both loops generate the same tokens. Each replica generates one summary at a time; with `BATCH_ENABLED=true` the items of a batch run one after another and each caller gets its own result.
 
 Generation settings come from `generation_config.json`, then `config.json`:
 

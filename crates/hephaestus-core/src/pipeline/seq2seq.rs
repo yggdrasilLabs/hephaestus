@@ -37,6 +37,7 @@ pub struct Seq2SeqOptions {
     max_input_tokens: Option<usize>,
     max_new_tokens: Option<usize>,
     timeout: Option<Duration>,
+    kv_cache: Option<bool>,
 }
 
 impl Seq2SeqOptions {
@@ -73,6 +74,19 @@ impl Seq2SeqOptions {
         self
     }
 
+    /// Switch the key/value cache of encoder-decoder generation on or off.
+    ///
+    /// Unset, the cache is used whenever the export has a
+    /// `decoder_model_merged.onnx` that supports it. `false` forces the
+    /// loop that re-reads every generated token at each step, on
+    /// `decoder_model.onnx` when that file exists. Both loops generate the
+    /// same tokens; the cached one does less work per token. A fused model
+    /// ignores this.
+    pub fn with_kv_cache(mut self, enabled: bool) -> Self {
+        self.kv_cache = Some(enabled);
+        self
+    }
+
     pub(super) fn max_input_tokens(&self) -> Option<usize> {
         self.max_input_tokens
     }
@@ -83,6 +97,11 @@ impl Seq2SeqOptions {
 
     pub(super) fn timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+
+    /// Whether the key/value cache may be used; on unless switched off.
+    pub(super) fn kv_cache(&self) -> bool {
+        self.kv_cache.unwrap_or(true)
     }
 }
 
@@ -174,6 +193,16 @@ impl Seq2SeqPipeline {
             tokenizer,
             decoder: None,
         })
+    }
+
+    /// Whether generation keeps a key/value cache between decoder steps.
+    ///
+    /// `true` only for an encoder-decoder export whose merged decoder was
+    /// loaded for the cached decode loop.
+    pub fn uses_kv_cache(&self) -> bool {
+        self.decoder
+            .as_ref()
+            .is_some_and(|decoder| decoder.uses_kv_cache())
     }
 
     /// Whether this pipeline runs the encoder-decoder decode loop.
@@ -525,6 +554,94 @@ mod tests {
         assert_eq!(options.max_input_tokens(), None);
         assert_eq!(options.max_new_tokens(), None);
         assert_eq!(options.timeout(), None);
+    }
+
+    #[test]
+    fn kv_cache_option_defaults_to_on() {
+        // Arrange / Act / Assert
+        assert!(Seq2SeqOptions::new().kv_cache());
+        assert!(Seq2SeqOptions::new().with_kv_cache(true).kv_cache());
+        assert!(!Seq2SeqOptions::new().with_kv_cache(false).kv_cache());
+    }
+
+    /// Token-for-token parity of the cached and the uncached decode loop
+    /// with each other and with a Hugging Face reference, on a real model.
+    ///
+    /// Same environment variables and cases file as
+    /// `encoder_decoder_token_ids_match_reference_cases`; the model
+    /// directory must hold `decoder_model_merged.onnx`. Run:
+    ///
+    /// `cargo test -p hephaestus-core --release --lib kv_cache_token_ids_match -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires an exported model and reference cases (see doc comment)"]
+    fn kv_cache_token_ids_match_uncached_loop_and_reference_cases() {
+        // Arrange
+        let model_dir = std::env::var("HEPHAESTUS_SEQ2SEQ_PARITY_MODEL_DIR")
+            .expect("HEPHAESTUS_SEQ2SEQ_PARITY_MODEL_DIR must be set");
+        let cases_path = std::env::var("HEPHAESTUS_SEQ2SEQ_PARITY_CASES")
+            .expect("HEPHAESTUS_SEQ2SEQ_PARITY_CASES must be set");
+        let cases: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cases_path).expect("read cases"))
+                .expect("parse cases");
+        let max_input_tokens = usize::try_from(
+            cases["max_input_tokens"]
+                .as_u64()
+                .expect("max_input_tokens"),
+        )
+        .expect("cap fits usize");
+        let load = |kv_cache: bool| {
+            let options = Seq2SeqOptions::new()
+                .with_max_input_tokens(max_input_tokens)
+                .with_kv_cache(kv_cache);
+            Seq2SeqPipeline::with_options(Path::new(&model_dir), &ExecutionProvider::Cpu, &options)
+                .expect("load")
+        };
+        let mut cached = load(true);
+        let mut uncached = load(false);
+        assert!(
+            cached.uses_kv_cache(),
+            "merged decoder must support a cache"
+        );
+        assert!(!uncached.uses_kv_cache());
+        let run = |pipeline: &mut Seq2SeqPipeline, text: &str| -> (Vec<i64>, f64) {
+            let prepared = pipeline.prepare(text.to_string()).expect("prepare");
+            let decoder = pipeline.decoder.as_mut().expect("encoder-decoder mode");
+            let started = std::time::Instant::now();
+            let generated = decoder
+                .generate(&mut pipeline.session, &prepared, None)
+                .expect("generate");
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            (generated.into_iter().map(i64::from).collect(), elapsed)
+        };
+
+        for case in cases["cases"].as_array().expect("cases array") {
+            let name = case["name"].as_str().expect("case name");
+            let text = case["text"].as_str().expect("case text");
+            let reference: Vec<i64> = case["token_ids"]
+                .as_array()
+                .expect("id list")
+                .iter()
+                .map(|id| id.as_i64().expect("integer id"))
+                .collect();
+
+            // Act
+            let (with_cache, cached_ms) = run(&mut cached, text);
+            let (without_cache, uncached_ms) = run(&mut uncached, text);
+            println!(
+                "{name}: {} generated tokens, cached {cached_ms:.0} ms, uncached {uncached_ms:.0} ms",
+                with_cache.len(),
+            );
+
+            // Assert
+            assert_eq!(
+                with_cache, without_cache,
+                "{name}: cached and uncached token IDs differ"
+            );
+            assert_eq!(
+                with_cache, reference,
+                "{name}: cached token IDs differ from the reference"
+            );
+        }
     }
 
     /// Token-for-token parity with a Hugging Face reference on a real model.

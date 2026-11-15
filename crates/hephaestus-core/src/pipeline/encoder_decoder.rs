@@ -1,10 +1,16 @@
 //! Encoder-decoder seq2seq mode: greedy autoregressive decoding.
 //!
 //! Serves the standard Optimum export of a text seq2seq model:
-//! `encoder_model.onnx` plus `decoder_model.onnx` (or
-//! `decoder_model_merged.onnx`). The encoder runs once per input; the
-//! decoder then runs once per generated token, without a key/value cache,
-//! so every step re-reads all tokens generated so far.
+//! `encoder_model.onnx` plus `decoder_model_merged.onnx` and/or
+//! `decoder_model.onnx`. The encoder runs once per input; the decoder then
+//! runs once per generated token.
+//!
+//! With a merged decoder the loop keeps a key/value cache: the first step
+//! runs the graph's uncached branch over the start tokens and keeps its
+//! `present.*` outputs, and every later step feeds only the newest token
+//! plus those tensors through the cached branch. Without a merged decoder
+//! (or with the cache switched off) every step re-reads all tokens
+//! generated so far. Both loops pick the same tokens.
 //!
 //! Everything a specific model could get wrong is checked when the
 //! pipeline is constructed -- file layout, graph input/output names and
@@ -16,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ort::session::{Session, SessionInputValue};
-use ort::value::{Outlet, TensorElementType, TensorRef};
+use ort::value::{DynValue, Outlet, TensorElementType, TensorRef};
 use tokenizers::Tokenizer;
 
 use crate::ep::ExecutionProvider;
@@ -27,7 +33,7 @@ use super::{PreparedInput, build_onnx_session};
 
 /// Encoder graph file name in an Optimum seq2seq export.
 const ENCODER_FILE: &str = "encoder_model.onnx";
-/// Decoder graph without key/value cache inputs (preferred).
+/// Decoder graph without key/value cache inputs (the uncached loop).
 const DECODER_FILE: &str = "decoder_model.onnx";
 /// Decoder graph holding both the cached and uncached branches.
 const MERGED_DECODER_FILE: &str = "decoder_model_merged.onnx";
@@ -64,14 +70,23 @@ const DECODER_TOKEN_INPUT_NAMES: [&str; 2] = ["input_ids", "decoder_input_ids"];
 
 /// Prefix of the key/value cache inputs of a merged decoder.
 const PAST_INPUT_PREFIX: &str = "past_key_values.";
+/// Prefix of the key/value cache outputs; the rest of the name matches
+/// the input it feeds on the next step.
+const PRESENT_OUTPUT_PREFIX: &str = "present.";
+/// Marks a cache tensor that holds encoder cross-attention state.
+const ENCODER_CACHE_MARKER: &str = ".encoder.";
 
-/// Paths of the two graphs that make up an encoder-decoder export.
+/// Paths of the graphs that make up an encoder-decoder export.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct EncoderDecoderFiles {
     /// Path to `encoder_model.onnx`.
     encoder: PathBuf,
-    /// Path to the chosen decoder graph, next to the encoder.
+    /// Path to the decoder graph for the uncached loop, next to the
+    /// encoder: `decoder_model.onnx`, else `decoder_model_merged.onnx`.
     decoder: PathBuf,
+    /// Path to `decoder_model_merged.onnx` when it exists next to the
+    /// encoder. The cached loop runs this graph.
+    merged_decoder: Option<PathBuf>,
 }
 
 impl EncoderDecoderFiles {
@@ -79,10 +94,12 @@ impl EncoderDecoderFiles {
     ///
     /// Looks in `{model_dir}/onnx/` first and then in `{model_dir}/`, the
     /// same order the single-file lookup uses. Both graphs must sit in the
-    /// same directory. `decoder_model.onnx` is preferred over
-    /// `decoder_model_merged.onnx`: without a key/value cache the plain
-    /// decoder is exactly the graph that is needed, while the merged one
-    /// only adds a second, unused branch and dummy cache inputs.
+    /// same directory. For the uncached loop `decoder_model.onnx` is
+    /// preferred over `decoder_model_merged.onnx`: without a key/value
+    /// cache the plain decoder is exactly the graph that is needed, while
+    /// the merged one only adds a second, unused branch and dummy cache
+    /// inputs. A merged decoder in that directory is reported separately,
+    /// for the cached loop.
     ///
     /// Returns `Ok(None)` when no encoder file exists, so the caller can
     /// report the missing model the way it always has.
@@ -105,7 +122,14 @@ impl EncoderDecoderFiles {
                 .map(|name| dir.join(name))
                 .find(|path| path.exists());
             match decoder {
-                Some(decoder) => return Ok(Some(Self { encoder, decoder })),
+                Some(decoder) => {
+                    let merged_decoder = Some(dir.join(MERGED_DECODER_FILE)).filter(|p| p.exists());
+                    return Ok(Some(Self {
+                        encoder,
+                        decoder,
+                        merged_decoder,
+                    }));
+                }
                 None => encoder_without_decoder = Some(encoder),
             }
         }
@@ -229,15 +253,24 @@ impl EncoderIo {
     }
 }
 
-/// A dummy key/value cache input of a merged decoder.
+/// A key/value cache input of a merged decoder.
 ///
 /// The uncached branch ignores the values, but ONNX Runtime still needs a
-/// tensor of a valid shape for every declared input.
+/// tensor of a valid shape for every declared input, so it is fed zeros.
+/// The cached branch is fed the matching `present.*` output of an earlier
+/// step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PastInput {
     name: String,
     /// Declared shape with every dynamic dimension replaced by 1.
     dims: Vec<usize>,
+    /// Name of the float32 output that feeds this input on the next step
+    /// (`present.<rest of the input name>`); `None` when the graph has none.
+    present_output: Option<String>,
+    /// Whether this is encoder cross-attention state. It does not change
+    /// between steps, and the cached branch of an Optimum merged decoder
+    /// returns an empty tensor for it, so the first step's tensor is kept.
+    from_encoder: bool,
 }
 
 impl PastInput {
@@ -246,13 +279,21 @@ impl PastInput {
     }
 }
 
-/// Extra inputs a merged decoder needs to run its uncached branch.
+/// Extra inputs of a merged decoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MergedInputs {
-    /// Name of the boolean branch selector; fed `false`.
+    /// Name of the boolean branch selector.
     use_cache_branch: String,
-    /// Key/value cache inputs, fed zeros.
+    /// Key/value cache inputs.
     past: Vec<PastInput>,
+}
+
+impl MergedInputs {
+    /// Whether the graph can run the cached loop: it has cache inputs and
+    /// returns a tensor to feed back into every one of them.
+    fn supports_cache(&self) -> bool {
+        !self.past.is_empty() && self.past.iter().all(|past| past.present_output.is_some())
+    }
 }
 
 /// How to feed the decoder graph and where to read its result.
@@ -317,10 +358,19 @@ impl DecoderIo {
             } else if name == "use_cache_branch" {
                 require_element_type("decoder", spec, TensorElementType::Bool)?;
                 use_cache_branch = Some(spec.name.clone());
-            } else if name.starts_with(PAST_INPUT_PREFIX) {
+            } else if let Some(slot) = name.strip_prefix(PAST_INPUT_PREFIX) {
                 require_element_type("decoder", spec, TensorElementType::Float32)?;
+                let present = format!("{PRESENT_OUTPUT_PREFIX}{slot}");
                 past.push(PastInput {
                     name: spec.name.clone(),
+                    present_output: outputs
+                        .iter()
+                        .any(|output| {
+                            output.name == present
+                                && output.element_type == Some(TensorElementType::Float32)
+                        })
+                        .then_some(present),
+                    from_encoder: name.contains(ENCODER_CACHE_MARKER),
                     dims: spec
                         .dims
                         .iter()
@@ -704,6 +754,8 @@ pub(super) struct EncoderDecoder {
     timeout: Option<Duration>,
     /// Zeros backing the dummy cache inputs of a merged decoder.
     past_zeros: Vec<f32>,
+    /// Whether generation keeps a key/value cache between decoder steps.
+    kv_cache: bool,
 }
 
 impl EncoderDecoder {
@@ -755,11 +807,12 @@ impl EncoderDecoder {
             &TensorSpec::from_outlets(encoder.inputs()),
             &TensorSpec::from_outlets(encoder.outputs()),
         )?;
-        let decoder = build_onnx_session(&files.decoder, ep)?;
-        let decoder_io = DecoderIo::from_specs(
-            &TensorSpec::from_outlets(decoder.inputs()),
-            &TensorSpec::from_outlets(decoder.outputs()),
-        )?;
+        let (decoder_path, decoder, decoder_io) = load_decoder(files, ep, options.kv_cache())?;
+        let kv_cache = options.kv_cache()
+            && decoder_io
+                .merged
+                .as_ref()
+                .is_some_and(MergedInputs::supports_cache);
 
         let past_zeros = decoder_io.merged.as_ref().map_or_else(Vec::new, |merged| {
             let longest = merged
@@ -773,8 +826,9 @@ impl EncoderDecoder {
 
         tracing::info!(
             encoder = %files.encoder.display(),
-            decoder = %files.decoder.display(),
+            decoder = %decoder_path.display(),
             merged_decoder = decoder_io.merged.is_some(),
+            kv_cache,
             max_input_tokens,
             max_new_tokens = settings.max_new_tokens,
             decoder_start_token_id = settings.decoder_start_token_id,
@@ -783,7 +837,7 @@ impl EncoderDecoder {
             forced_bos_token_id = ?settings.forced_bos_token_id,
             forced_eos_token_id = ?settings.forced_eos_token_id,
             no_repeat_ngram_size = settings.no_repeat_ngram_size,
-            "seq2seq encoder-decoder mode loaded (greedy decoding, no key/value cache)"
+            "seq2seq encoder-decoder mode loaded (greedy decoding)"
         );
         if settings.eos_token_ids.is_empty() {
             tracing::warn!(
@@ -802,8 +856,14 @@ impl EncoderDecoder {
                 settings,
                 timeout: options.timeout(),
                 past_zeros,
+                kv_cache,
             },
         ))
+    }
+
+    /// Whether generation keeps a key/value cache between decoder steps.
+    pub(super) fn uses_kv_cache(&self) -> bool {
+        self.kv_cache
     }
 
     /// The deadline for an input whose processing starts now.
@@ -813,8 +873,9 @@ impl EncoderDecoder {
 
     /// Generate output tokens for one tokenized input.
     ///
-    /// Runs the encoder once, then decodes greedily. Returns the generated
-    /// token IDs without the decoder start token.
+    /// Runs the encoder once, then decodes greedily, with a key/value
+    /// cache when the decoder supports one. Returns the generated token IDs
+    /// without the decoder start token.
     ///
     /// # Errors
     ///
@@ -877,15 +938,28 @@ impl EncoderDecoder {
             decoder_io,
             settings,
             past_zeros,
+            kv_cache,
             ..
         } = self;
-        let no_cache = [false];
+        let kv_cache = *kv_cache;
+        // Cache tensors in the order of the decoder's cache inputs, and the
+        // number of decoder tokens they cover. Local to this input.
+        let mut cache: Vec<DynValue> = Vec::new();
+        let mut cached_len = 0_usize;
         let generated = greedy_decode(settings, deadline, |tokens, banned| {
+            // The cached branch takes exactly the one token the cache does
+            // not cover yet. Anything else (the first step, which may hold
+            // a forced token after the start token) runs the uncached
+            // branch over the whole sequence and starts the cache afresh.
+            let reuse = kv_cache && cached_len > 0 && tokens.len() == cached_len + 1;
+            let fed_tokens = if reuse { &tokens[cached_len..] } else { tokens };
+            let branch = [reuse];
+
             let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
                 Vec::with_capacity(3 + decoder_io.merged.as_ref().map_or(0, |m| 1 + m.past.len()));
             inputs.push((
                 Cow::Borrowed(decoder_io.tokens_input.as_str()),
-                int64_tensor(tokens.len(), tokens)?.into(),
+                int64_tensor(fed_tokens.len(), fed_tokens)?.into(),
             ));
             inputs.push((
                 Cow::Borrowed(decoder_io.encoder_hidden_input.as_str()),
@@ -902,24 +976,26 @@ impl EncoderDecoder {
             if let Some(merged) = &decoder_io.merged {
                 inputs.push((
                     Cow::Borrowed(merged.use_cache_branch.as_str()),
-                    TensorRef::from_array_view(([1_usize], no_cache.as_slice()))
+                    TensorRef::from_array_view(([1_usize], branch.as_slice()))
                         .map_err(|e| CoreError::Inference(e.to_string()))?
                         .into(),
                 ));
-                for past in &merged.past {
-                    inputs.push((
-                        Cow::Borrowed(past.name.as_str()),
+                for (index, past) in merged.past.iter().enumerate() {
+                    let value: SessionInputValue<'_> = if reuse {
+                        (&cache[index]).into()
+                    } else {
                         TensorRef::from_array_view((
                             past.dims.as_slice(),
                             &past_zeros[..past.element_count()],
                         ))
                         .map_err(|e| CoreError::Inference(e.to_string()))?
-                        .into(),
-                    ));
+                        .into()
+                    };
+                    inputs.push((Cow::Borrowed(past.name.as_str()), value));
                 }
             }
 
-            let outputs = decoder
+            let mut outputs = decoder
                 .run(inputs)
                 .map_err(|e| CoreError::Inference(format!("decoder run failed: {e}")))?;
             let logits = outputs.get(&decoder_io.logits_output).ok_or_else(|| {
@@ -948,6 +1024,27 @@ impl EncoderDecoder {
                 ))
             })?;
             let token = argmax_excluding(&data[last_position..], banned)?;
+
+            if kv_cache && let Some(merged) = &decoder_io.merged {
+                if !reuse {
+                    cache.clear();
+                }
+                for (index, past) in merged.past.iter().enumerate() {
+                    // The cached branch returns no encoder cross-attention
+                    // state; the tensors of the first step stay in place.
+                    if reuse && past.from_encoder {
+                        continue;
+                    }
+                    let value = take_cache_tensor(&mut outputs, past)?;
+                    if reuse {
+                        cache[index] = value;
+                    } else {
+                        cache.push(value);
+                    }
+                }
+                cached_len = tokens.len();
+            }
+
             i64::try_from(token).map_err(|_| {
                 CoreError::Inference(format!("token index {token} does not fit a token ID"))
             })
@@ -971,6 +1068,92 @@ impl EncoderDecoder {
             })
             .collect()
     }
+}
+
+/// Load the decoder graph and derive its wiring.
+///
+/// With `kv_cache` set, a merged decoder that can feed its cache back is
+/// preferred. When a plain decoder sits next to a merged one that cannot
+/// be used that way (or cannot be loaded at all), the plain decoder runs
+/// instead, exactly as it does for an export without a merged decoder.
+///
+/// Returns the path of the graph that was loaded, its session and wiring.
+///
+/// # Errors
+///
+/// Returns [`CoreError`] if the decoder that ends up chosen cannot be
+/// loaded or does not have the inputs and outputs this mode can drive.
+fn load_decoder(
+    files: &EncoderDecoderFiles,
+    ep: &ExecutionProvider,
+    kv_cache: bool,
+) -> Result<(PathBuf, Session, DecoderIo), CoreError> {
+    let open = |path: &Path| -> Result<(Session, DecoderIo), CoreError> {
+        let session = build_onnx_session(path, ep)?;
+        let io = DecoderIo::from_specs(
+            &TensorSpec::from_outlets(session.inputs()),
+            &TensorSpec::from_outlets(session.outputs()),
+        )?;
+        Ok((session, io))
+    };
+
+    let separate_merged = files
+        .merged_decoder
+        .as_ref()
+        .filter(|merged| kv_cache && **merged != files.decoder);
+    if let Some(merged) = separate_merged {
+        match open(merged) {
+            Ok((session, io)) if io.merged.as_ref().is_some_and(MergedInputs::supports_cache) => {
+                return Ok((merged.clone(), session, io));
+            }
+            Ok(_) => tracing::warn!(
+                merged_decoder = %merged.display(),
+                decoder = %files.decoder.display(),
+                "merged decoder cannot feed a key/value cache back; decoding without a cache"
+            ),
+            Err(error) => tracing::warn!(
+                merged_decoder = %merged.display(),
+                decoder = %files.decoder.display(),
+                %error,
+                "merged decoder could not be used; decoding without a cache"
+            ),
+        }
+    }
+
+    let (session, io) = open(&files.decoder)?;
+    Ok((files.decoder.clone(), session, io))
+}
+
+/// Take the tensor that feeds `past` on the next step out of the outputs.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Inference`] if the decoder did not return the
+/// tensor or returned it without elements: an empty tensor fed back as
+/// cache would silently change what the model attends to.
+fn take_cache_tensor(
+    outputs: &mut ort::session::SessionOutputs<'_>,
+    past: &PastInput,
+) -> Result<DynValue, CoreError> {
+    let name = past.present_output.as_deref().ok_or_else(|| {
+        CoreError::Inference(format!(
+            "decoder has no output to feed cache input '{}'",
+            past.name,
+        ))
+    })?;
+    let value = outputs
+        .remove(name)
+        .ok_or_else(|| CoreError::Inference(format!("decoder did not return output '{name}'")))?;
+    let is_empty = value
+        .dtype()
+        .tensor_shape()
+        .is_none_or(|shape| shape.contains(&0));
+    if is_empty {
+        return Err(CoreError::Inference(format!(
+            "decoder returned an empty cache tensor '{name}'",
+        )));
+    }
+    Ok(value)
 }
 
 /// Borrow a token slice as a `(1, len)` int64 tensor.
@@ -1077,6 +1260,65 @@ mod tests {
 
         // Assert
         assert_eq!(files.decoder, dir.path().join(MERGED_DECODER_FILE));
+    }
+
+    #[test]
+    fn locate_reports_merged_decoder_next_to_plain_decoder() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("temp dir");
+        for name in [ENCODER_FILE, DECODER_FILE, MERGED_DECODER_FILE] {
+            std::fs::write(dir.path().join(name), b"").expect("write");
+        }
+
+        // Act
+        let files = EncoderDecoderFiles::locate(dir.path())
+            .expect("lookup should not fail")
+            .expect("export should be found");
+
+        // Assert -- the cached loop gets the merged graph, the uncached
+        // loop keeps the plain one.
+        assert_eq!(
+            files.merged_decoder,
+            Some(dir.path().join(MERGED_DECODER_FILE))
+        );
+        assert_eq!(files.decoder, dir.path().join(DECODER_FILE));
+    }
+
+    #[test]
+    fn locate_reports_no_merged_decoder_when_only_plain_exists() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("temp dir");
+        for name in [ENCODER_FILE, DECODER_FILE] {
+            std::fs::write(dir.path().join(name), b"").expect("write");
+        }
+
+        // Act
+        let files = EncoderDecoderFiles::locate(dir.path())
+            .expect("lookup should not fail")
+            .expect("export should be found");
+
+        // Assert
+        assert_eq!(files.merged_decoder, None);
+    }
+
+    #[test]
+    fn locate_ignores_merged_decoder_outside_the_encoder_directory() {
+        // Arrange -- the export is in onnx/, a stray merged file is not.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let onnx = dir.path().join("onnx");
+        std::fs::create_dir(&onnx).expect("mkdir");
+        for name in [ENCODER_FILE, DECODER_FILE] {
+            std::fs::write(onnx.join(name), b"").expect("write");
+        }
+        std::fs::write(dir.path().join(MERGED_DECODER_FILE), b"").expect("write");
+
+        // Act
+        let files = EncoderDecoderFiles::locate(dir.path())
+            .expect("lookup should not fail")
+            .expect("export should be found");
+
+        // Assert
+        assert_eq!(files.merged_decoder, None);
     }
 
     #[test]
@@ -1230,6 +1472,128 @@ mod tests {
         assert_eq!(merged.past.len(), 1);
         assert_eq!(merged.past[0].dims, vec![1, 16, 1, 64]);
         assert_eq!(merged.past[0].element_count(), 1024);
+    }
+
+    /// The inputs and outputs of Optimum's merged BART decoder, one layer.
+    fn merged_bart_specs() -> (Vec<TensorSpec>, Vec<TensorSpec>) {
+        let cache = |name: &str| spec(name, TensorElementType::Float32, &[-1, 16, -1, 64]);
+        let slots = [
+            "decoder.key",
+            "decoder.value",
+            "encoder.key",
+            "encoder.value",
+        ];
+        let mut inputs = vec![
+            int64("encoder_attention_mask"),
+            int64("input_ids"),
+            float32("encoder_hidden_states"),
+        ];
+        inputs.extend(
+            slots
+                .iter()
+                .map(|slot| cache(&format!("past_key_values.0.{slot}"))),
+        );
+        inputs.push(spec("use_cache_branch", TensorElementType::Bool, &[1]));
+        let mut outputs = vec![float32("logits")];
+        outputs.extend(slots.iter().map(|slot| cache(&format!("present.0.{slot}"))));
+        (inputs, outputs)
+    }
+
+    #[test]
+    fn decoder_io_pairs_cache_inputs_with_present_outputs() {
+        // Arrange
+        let (inputs, outputs) = merged_bart_specs();
+
+        // Act
+        let io = DecoderIo::from_specs(&inputs, &outputs).expect("valid merged decoder");
+
+        // Assert -- every input has its output; encoder slots are marked.
+        let merged = io.merged.expect("merged inputs should be detected");
+        assert!(merged.supports_cache());
+        let pairs: Vec<(&str, Option<&str>, bool)> = merged
+            .past
+            .iter()
+            .map(|past| {
+                (
+                    past.name.as_str(),
+                    past.present_output.as_deref(),
+                    past.from_encoder,
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "past_key_values.0.decoder.key",
+                    Some("present.0.decoder.key"),
+                    false
+                ),
+                (
+                    "past_key_values.0.decoder.value",
+                    Some("present.0.decoder.value"),
+                    false
+                ),
+                (
+                    "past_key_values.0.encoder.key",
+                    Some("present.0.encoder.key"),
+                    true
+                ),
+                (
+                    "past_key_values.0.encoder.value",
+                    Some("present.0.encoder.value"),
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn decoder_io_does_not_support_cache_when_a_present_output_is_missing() {
+        // Arrange
+        let (inputs, mut outputs) = merged_bart_specs();
+        outputs.retain(|output| output.name != "present.0.decoder.value");
+
+        // Act
+        let io = DecoderIo::from_specs(&inputs, &outputs).expect("valid merged decoder");
+
+        // Assert -- still a usable merged decoder, for the uncached loop.
+        let merged = io.merged.expect("merged inputs should be detected");
+        assert!(!merged.supports_cache());
+    }
+
+    #[test]
+    fn decoder_io_does_not_support_cache_when_a_present_output_is_not_float32() {
+        // Arrange
+        let (inputs, mut outputs) = merged_bart_specs();
+        for output in &mut outputs {
+            if output.name == "present.0.encoder.key" {
+                output.element_type = Some(TensorElementType::Float16);
+            }
+        }
+
+        // Act
+        let io = DecoderIo::from_specs(&inputs, &outputs).expect("valid merged decoder");
+
+        // Assert
+        assert!(!io.merged.expect("merged inputs").supports_cache());
+    }
+
+    #[test]
+    fn decoder_io_does_not_support_cache_without_cache_inputs() {
+        // Arrange -- a branch selector but nothing to cache.
+        let inputs = [
+            int64("input_ids"),
+            float32("encoder_hidden_states"),
+            spec("use_cache_branch", TensorElementType::Bool, &[1]),
+        ];
+        let outputs = [float32("logits")];
+
+        // Act
+        let io = DecoderIo::from_specs(&inputs, &outputs).expect("valid merged decoder");
+
+        // Assert
+        assert!(!io.merged.expect("merged inputs").supports_cache());
     }
 
     #[test]
