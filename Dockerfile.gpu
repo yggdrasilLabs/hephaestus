@@ -1,0 +1,76 @@
+# GPU image: hephaestus built with `--features cuda` on an NVIDIA CUDA runtime.
+#
+#   docker buildx build --platform linux/amd64 -f Dockerfile.gpu \
+#     --secret id=github_token,env=GITHUB_TOKEN -t <registry>/hephaestus:gpu_<tag> .
+#
+# linux/amd64 only: the ONNX Runtime binaries the `ort` crate downloads have a
+# CUDA build for x86_64 Linux and none for aarch64 (an arm64 GPU image needs
+# ONNX Runtime compiled from source). That build is for CUDA 13, so the
+# runtime stage is a CUDA 13 + cuDNN image. Run with EXECUTION_PROVIDER=cuda
+# and an `nvidia.com/gpu` resource; with `cpu` it behaves like the CPU image.
+
+# ---------- builder ----------
+FROM ubuntu:24.04 AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       curl ca-certificates build-essential pkg-config libssl-dev protobuf-compiler git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /build
+
+# Use the system linker instead of rust-lld, as the CPU image does.
+RUN mkdir -p .cargo \
+    && printf '[build]\nrustflags = ["-C", "linker=g++", "-C", "link-arg=-lstdc++"]\n' > .cargo/config.toml
+
+# scylla-client is a git dependency on a private repo. cargo fetches it with
+# the git CLI, authenticated for that one command by a GitHub token passed as
+# a BuildKit secret (--secret id=github_token,env=...). Nothing lands in a layer.
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+# The CUDA major version of the ONNX Runtime build to download.
+ENV ORT_CUDA_VERSION=13
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+# ort-sys 2.0.0-rc.13 links the ONNX Runtime libraries into three directories
+# under target/release/build and stops if the last two do not exist yet.
+RUN mkdir -p target/release/build/examples target/release/build/deps
+RUN --mount=type=secret,id=github_token \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/github_token)@github.com/.insteadOf" \
+    GIT_CONFIG_VALUE_0="https://github.com/" \
+    cargo build --release -p hephaestus --bin hephaestus --features cuda
+
+# The binary, and the ONNX Runtime libraries next to it (copied as files, not
+# as the links cargo leaves). The execution providers are loaded at run time
+# from that directory, so `ldd` does not list them; the build stops here if
+# the CUDA one is missing.
+RUN mkdir -p /out/app /out/cache \
+    && cp target/release/hephaestus /out/app/hephaestus \
+    && find / -xdev -name 'libonnxruntime*.so*' -not -path '/out/*' -exec cp -Ln {} /out/app/ \; \
+    && ls -l /out/app && ldd /out/app/hephaestus \
+    && test -s /out/app/libonnxruntime_providers_cuda.so \
+    && chown 65534:65534 /out/cache
+
+# ---------- runtime ----------
+FROM nvidia/cuda:13.5.0-cudnn-runtime-ubuntu24.04
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3t64 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out/app/ /opt/hephaestus/
+COPY --from=builder --chown=65534:65534 /out/cache /cache
+
+ENV LD_LIBRARY_PATH=/opt/hephaestus
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV HOME=/cache
+ENV PORT=8080
+EXPOSE 8080
+
+USER 65534
+
+ENTRYPOINT ["/opt/hephaestus/hephaestus"]
