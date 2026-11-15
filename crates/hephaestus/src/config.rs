@@ -26,6 +26,9 @@ const ALLOWED_STORAGE_TYPES: &[&str] = &["s3", "fs", "gcs", "none"];
 /// limit, checked when the pipeline loads, is usually far lower.
 const SEQ2SEQ_MAX_INPUT_TOKENS_LIMIT: u32 = 16_384;
 
+/// Largest accepted `INFERENCE_QUEUE_CAPACITY`.
+const INFERENCE_QUEUE_CAPACITY_LIMIT: u32 = 65_536;
+
 /// Runtime configuration deserialized from environment variables.
 ///
 /// # Required
@@ -71,6 +74,12 @@ pub struct Config {
     /// Per-request inference timeout in seconds (default: 30, env `REQUEST_TIMEOUT_SECS`).
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+
+    /// Most requests that may wait for the model at one time (default: 1024,
+    /// env `INFERENCE_QUEUE_CAPACITY`). A request that arrives when that
+    /// many are waiting is refused at once with HTTP 503 and `Retry-After`.
+    #[serde(default = "default_inference_queue_capacity")]
+    pub inference_queue_capacity: u32,
 
     /// Graceful shutdown drain timeout in seconds (default: 30, env `SHUTDOWN_TIMEOUT_SECS`).
     #[serde(default = "default_shutdown_timeout_secs")]
@@ -203,6 +212,10 @@ fn default_request_timeout_secs() -> u64 {
 
 fn default_shutdown_timeout_secs() -> u64 {
     30
+}
+
+fn default_inference_queue_capacity() -> u32 {
+    hephaestus_api::DEFAULT_QUEUE_CAPACITY as u32
 }
 
 fn default_batch_max_size() -> u32 {
@@ -350,6 +363,15 @@ impl Config {
                 "OVERLAP_SECS must be non-negative and less than WINDOW_SIZE_SECS ({}) (got {})",
                 self.window_size_secs,
                 self.overlap_secs,
+            );
+        }
+
+        if self.inference_queue_capacity < 1
+            || self.inference_queue_capacity > INFERENCE_QUEUE_CAPACITY_LIMIT
+        {
+            bail!(
+                "INFERENCE_QUEUE_CAPACITY must be between 1 and {INFERENCE_QUEUE_CAPACITY_LIMIT} (got {})",
+                self.inference_queue_capacity,
             );
         }
 
@@ -678,6 +700,7 @@ mod tests {
             warmup_input: None,
             port: 8080,
             request_timeout_secs: 30,
+            inference_queue_capacity: 1024,
             shutdown_timeout_secs: 30,
             otel_exporter_otlp_endpoint: None,
             storage_type: "s3".to_string(),
@@ -804,6 +827,26 @@ mod tests {
             msg.contains("does not exist"),
             "error should mention 'does not exist': {msg}"
         );
+    }
+
+    #[test]
+    fn inference_queue_capacity_must_be_in_range() {
+        for (capacity, accepted) in [(0, false), (1, true), (1024, true), (65_536, true), (65_537, false)] {
+            // Arrange
+            let mut config = config_with_model_path(None);
+            config.inference_queue_capacity = capacity;
+
+            // Act
+            let result = config.validate();
+
+            // Assert
+            assert_eq!(result.is_ok(), accepted, "capacity {capacity}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn inference_queue_capacity_defaults_to_the_api_default() {
+        assert_eq!(default_inference_queue_capacity(), 1024);
     }
 
     #[test]

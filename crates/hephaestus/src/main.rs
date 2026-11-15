@@ -43,6 +43,7 @@ async fn main() -> Result<(), anyhow::Error> {
         execution_provider = %ep,
         port = config.port,
         request_timeout_secs = config.request_timeout_secs,
+        inference_queue_capacity = config.inference_queue_capacity,
         shutdown_timeout_secs = config.shutdown_timeout_secs,
         storage_type = %config.storage_type,
         storage_bucket = ?config.storage_bucket,
@@ -233,15 +234,18 @@ async fn main() -> Result<(), anyhow::Error> {
         None => (None, None),
     };
 
-    let state = Arc::new(AppState::new(
-        pipeline_kind,
-        config.model_id.clone(),
-        Duration::from_secs(config.request_timeout_secs),
-        metrics_handle,
-        batcher_opt,
-        config.window_size_secs,
-        config.overlap_secs,
-    ));
+    let state = Arc::new(
+        AppState::new(
+            pipeline_kind,
+            config.model_id.clone(),
+            Duration::from_secs(config.request_timeout_secs),
+            metrics_handle,
+            batcher_opt,
+            config.window_size_secs,
+            config.overlap_secs,
+        )
+        .with_inference_queue_capacity(config.inference_queue_capacity as usize),
+    );
 
     // 5b. Spawn batcher background task if batching is enabled (D-06).
     if let Some(receiver) = batcher_rx {
@@ -429,7 +433,8 @@ async fn main() -> Result<(), anyhow::Error> {
 /// On signal receipt, flips readiness to false so the k8s readiness
 /// probe returns 503, updates the gRPC health reporter to NOT_SERVING,
 /// and the load balancer stops routing new traffic while in-flight
-/// requests drain (D-07, SC-03).
+/// requests drain (D-07, SC-03). The inference queue is closed: the job
+/// that is running finishes, queued jobs are answered with 503.
 async fn shutdown_signal(
     state: Arc<AppState>,
     health_reporter: tonic_health::server::HealthReporter,
@@ -458,6 +463,7 @@ async fn shutdown_signal(
 
     tracing::info!("shutdown signal received, draining connections");
     state.set_ready(false);
+    state.shutdown_inference();
     health_reporter
         .set_service_status("", tonic_health::ServingStatus::NotServing)
         .await;

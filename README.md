@@ -122,6 +122,7 @@ hephaestus/
 │   │   │   ├── routes.rs               # Axum router (/infer, /health, /metrics)
 │   │   │   ├── handlers.rs             # Request → inference → response
 │   │   │   ├── telemetry.rs            # OTel + Prometheus setup
+│   │   │   ├── worker.rs               # Inference worker thread + bounded job queue
 │   │   │   └── batcher.rs              # Dynamic batching (configurable)
 │   │   └── tests/                      # API integration tests
 │   ├── hephaestus-resolve/             # Model resolution — storage, HuggingFace, Forge
@@ -162,7 +163,8 @@ hephaestus/
 | **`BATCH_ENABLED`** | `false` | Enable dynamic request batching |
 | **`BATCH_MAX_SIZE`** | `8` | Max requests per batch (1-64) |
 | **`BATCH_MAX_WAIT_MS`** | `50` | Max wait time before executing a partial batch |
-| **`REQUEST_TIMEOUT_SECS`** | `30` | Per-request inference timeout |
+| **`REQUEST_TIMEOUT_SECS`** | `30` | Per-request inference timeout, measured from the arrival of the request. A request still waiting for the model at that moment is dropped without running. |
+| **`INFERENCE_QUEUE_CAPACITY`** | `1024` | Most requests that may wait for the model at one time, 1-65536. One more is refused at once with HTTP 503, `Retry-After: 1` and error code `QUEUE_FULL` (gRPC `UNAVAILABLE`). The default is far above what a single-pass model queues under normal load; set a small value (for example `4`) for seq2seq and text generation models, where each waiting request takes seconds. Not applied with `BATCH_ENABLED=true`, where requests wait in the batcher's own bounded channel. |
 | **`SEQ2SEQ_MAX_INPUT_TOKENS`** | — | Seq2seq only. Input token cap, 8-16384; an encoder-decoder model also rejects a value above its `max_position_embeddings`. Unset: 512, as for every other profile. |
 | **`SEQ2SEQ_MAX_NEW_TOKENS`** | — | Seq2seq encoder-decoder models only. Most tokens generated per request, 1-4096. Unset: taken from the model's generation settings. |
 | **`TEXT_GENERATION_MAX_INPUT_TOKENS`** | — | Text generation only. Cap on prompt tokens (chat template, system message and user text together), 16-32768; startup fails if it plus the new-token limit exceeds the model's context. Unset: 4096, or less when the model's context minus the new-token limit is smaller. |
@@ -299,6 +301,24 @@ curl -X POST http://localhost:8080/infer \
   -H "Content-Type: application/json" \
   -d '{"text": "This product is amazing"}'
 ```
+
+### Inference queue
+
+One thread per replica runs the model, one job at a time. `/infer`, gRPC `Infer` and the WebSocket endpoint put jobs on a bounded queue (`INFERENCE_QUEUE_CAPACITY`) and wait for the result; tokenization happens before queueing and never waits for the model.
+
+- Queue full: the request is refused at once with HTTP 503, `Retry-After: 1` and `{"error": {"code": "QUEUE_FULL", ...}}` (gRPC `UNAVAILABLE`). The readiness probe is not affected.
+- A job whose `REQUEST_TIMEOUT_SECS` deadline passes while it is queued, or whose client has gone, is removed without running.
+- On SIGTERM the job that is running finishes; queued jobs and new requests get 503 `NOT_READY`.
+- With `BATCH_ENABLED=true` requests wait in the batcher's channel instead (4 × `BATCH_MAX_SIZE`, senders wait rather than being refused); each batch is one job.
+
+Metrics, all labelled `model_id`:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `hephaestus_inference_queue_depth` | gauge | Requests admitted and not yet started |
+| `hephaestus_inference_queue_wait_seconds` | histogram | Time from admission to the start of the run |
+| `hephaestus_inference_jobs_rejected_total` | counter | Requests refused; `reason` is `queue_full` or `shutting_down` |
+| `hephaestus_inference_jobs_dropped_total` | counter | Queued requests that never ran; `reason` is `abandoned` (caller timed out or disconnected), `expired` (deadline passed, caller still waiting) or `shutdown` |
 
 ### Kubernetes deployment (one model per pod)
 

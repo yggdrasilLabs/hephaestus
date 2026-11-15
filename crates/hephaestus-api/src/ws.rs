@@ -388,23 +388,21 @@ async fn handle_transcribe_socket(
 
 /// Run ASR inference on a window of audio samples.
 ///
-/// Acquires a read lock for prepare (feature extraction), then a write
-/// lock for execute (ONNX session). Extracts transcript text from the
-/// pipeline output.
+/// Takes a place in the inference queue, prepares the window (feature
+/// extraction), then runs on the inference worker thread.
+/// Extracts transcript text from the pipeline output.
 async fn run_asr_inference(
     state: &AppState,
     samples: Vec<f32>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // Read lock for prepare (tokenization/feature extraction).
-    let prepared = {
-        let pipeline = state.read_pipeline().await;
-        pipeline.prepare(InferenceInput::Audio(samples))?
-    };
+    // A window has no deadline; a full queue fails it at once.
+    let ticket = state.admit(None)?;
 
-    // Write lock for execute (ONNX session mutation), on a blocking thread.
-    let output = state
-        .run_inference(move |pipeline| pipeline.execute(prepared))
-        .await??;
+    // Feature extraction.
+    let prepared = state.prepare(InferenceInput::Audio(samples))?;
+
+    // The ONNX session runs on the inference worker thread.
+    let output = ticket.run(prepared, None).await?;
 
     match output {
         PipelineOutput::Asr(text) => Ok(text),

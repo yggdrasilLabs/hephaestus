@@ -22,7 +22,7 @@ use crate::state::AppState;
 ///
 /// Holds a reference to shared [`AppState`] and follows the same
 /// control flow as the HTTP handler: readiness check, input validation,
-/// timeout-wrapped inference (with read/write lock split or batcher),
+/// timeout-wrapped inference (through the inference queue or the batcher),
 /// and model-determined JSON output serialized into `result_json` bytes.
 pub struct GrpcInferenceService {
     state: Arc<AppState>,
@@ -55,41 +55,30 @@ impl InferenceService for GrpcInferenceService {
 
         let request_start = Instant::now();
         let timer = StageTimer::new(self.state.model_id());
+        // A job still queued at this moment is dropped instead of run.
+        let deadline = request_start + self.state.request_timeout();
 
         // Wrap inference in a request-level timeout (mirrors HTTP handler).
         let result = tokio::time::timeout(self.state.request_timeout(), async {
             if self.state.is_batching_enabled() {
-                // Batching path: prepare under read lock, drop lock, submit to batcher.
-                // Pipeline RwLock is NOT held across the batcher submit await
-                // per rules/anti-lock-across-await.md.
-                let prepared = {
-                    let pipeline = self.state.read_pipeline().await;
-                    timer.time("tokenization", || pipeline.prepare(req.text))?
-                }; // Read lock dropped here before submit.
+                // Batching path: prepare, then submit to the batcher.
+                let prepared = timer.time("tokenization", || self.state.prepare(req.text))?;
 
                 let pipeline_output = self
                     .state
                     .batcher()
                     .ok_or(ApiError::Internal("batcher not available".into()))?
-                    .submit(prepared)
-                    .await
-                    .map_err(ApiError::from)?;
+                    .submit(prepared, Some(deadline))
+                    .await?;
                 Ok::<_, ApiError>(pipeline_output.to_json())
             } else {
-                // Direct path: read lock for prepare, write lock for execute.
-                let prepared = {
-                    let pipeline = self.state.read_pipeline().await;
-                    timer.time("tokenization", || pipeline.prepare(req.text))?
-                }; // Read lock dropped here.
-                // The model runs on a blocking thread, which holds the
-                // write lock until it finishes, so this task only waits.
-                let stage_timer = timer.clone();
-                let pipeline_output = self
-                    .state
-                    .run_inference(move |pipeline| {
-                        stage_timer.time("inference", || pipeline.execute(prepared))
-                    })
-                    .await??;
+                // Direct path: a place in the inference queue first (refused
+                // at once when it is full), then prepare.
+                let ticket = self.state.admit(Some(deadline))?;
+                let prepared = timer.time("tokenization", || self.state.prepare(req.text))?;
+                // The model runs on the inference worker thread, so this
+                // task only waits.
+                let pipeline_output = ticket.run(prepared, Some(timer.clone())).await?;
                 Ok::<_, ApiError>(pipeline_output.to_json())
             }
         })

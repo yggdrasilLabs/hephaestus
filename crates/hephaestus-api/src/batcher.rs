@@ -2,27 +2,32 @@
 //!
 //! When dynamic batching is enabled, HTTP requests are submitted to a
 //! bounded [`mpsc`] channel. A background [`batcher_loop`] task collects
-//! requests over a configurable time window and runs batched ONNX
-//! inference via [`PipelineKind::execute_batch`]. Results are fanned
-//! back to individual requests through [`oneshot`] channels.
+//! requests over a configurable time window and hands each batch to the
+//! inference worker, which runs it through
+//! [`PipelineKind::execute_batch`](hephaestus_core::PipelineKind::execute_batch)
+//! and answers every request on its [`oneshot`] channel.
 //!
 //! When batching is disabled (default), none of this machinery is
 //! instantiated -- zero overhead per D-07.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use hephaestus_core::{CoreError, PipelineOutput, PreparedData};
+use hephaestus_core::{PipelineOutput, PreparedData};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::error::ApiError;
 use crate::state::AppState;
 
 /// A single inference request queued for batching.
 pub struct BatchRequest {
     /// The tokenized and prepared input ready for inference.
     pub prepared: PreparedData,
+    /// When the caller stops waiting. A request still waiting for the
+    /// model at that moment is answered with a timeout and not run.
+    pub deadline: Option<Instant>,
     /// One-shot channel to send the result back to the HTTP handler.
-    pub reply: oneshot::Sender<Result<PipelineOutput, CoreError>>,
+    pub reply: oneshot::Sender<Result<PipelineOutput, ApiError>>,
 }
 
 /// Handle for submitting requests to the batcher.
@@ -55,36 +60,34 @@ impl Batcher {
     /// Creates a oneshot channel, sends the request into the batch
     /// queue, and awaits the result. Backpressure is applied when the
     /// channel is full -- the `.send().await` suspends until space is
-    /// available.
+    /// available. `deadline` is when the caller stops waiting.
     ///
     /// # Errors
     ///
-    /// Returns `CoreError::Inference` if the batch channel is closed
+    /// Returns [`ApiError::Inference`] if the batch channel is closed
     /// (batcher task panicked or shut down) or if the oneshot reply
-    /// channel is dropped without a response.
+    /// channel is dropped without a response, [`ApiError::Timeout`] if
+    /// `deadline` passed before the batch ran, and the pipeline's own
+    /// error if the run failed.
     pub async fn submit(
         &self,
         prepared: PreparedData,
-    ) -> Result<PipelineOutput, CoreError> {
+        deadline: Option<Instant>,
+    ) -> Result<PipelineOutput, ApiError> {
         let (reply_tx, reply_rx) = oneshot::channel();
 
         self.tx
             .send(BatchRequest {
                 prepared,
+                deadline,
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| {
-                CoreError::Inference("batcher channel closed".to_string())
-            })?;
+            .map_err(|_| ApiError::Inference("batcher channel closed".to_string()))?;
 
-        reply_rx
-            .await
-            .map_err(|_| {
-                CoreError::Inference(
-                    "batcher reply channel dropped without response".to_string(),
-                )
-            })?
+        reply_rx.await.map_err(|_| {
+            ApiError::Inference("batcher reply channel dropped without response".to_string())
+        })?
     }
 }
 
@@ -92,13 +95,14 @@ impl Batcher {
 ///
 /// Waits for the first request, then collects additional requests
 /// until either `max_batch_size` is reached or `max_wait` elapses.
-/// Write-locks the pipeline RwLock only during `execute_batch`, which runs
-/// on a blocking thread ([`AppState::run_inference`]) -- never
-/// during the collection phase per [`rules/anti-lock-across-await.md`].
+/// The batch then runs as one job on the inference worker thread, which
+/// write-locks the pipeline only during `execute_batch` -- never during
+/// the collection phase per [`rules/anti-lock-across-await.md`] -- and
+/// answers every request itself. A request whose caller has gone or
+/// whose deadline has passed by then is left out of the batch.
 ///
-/// On any `execute_batch` failure, the error is sent to ALL pending
-/// oneshot channels so no request hangs. Uses `let _ = reply.send()`
-/// to handle dropped receivers (HTTP request may have timed out).
+/// The next batch is collected only after this one has finished, so
+/// requests that arrive meanwhile wait in the channel as before.
 pub async fn batcher_loop(
     mut rx: mpsc::Receiver<BatchRequest>,
     state: Arc<AppState>,
@@ -136,35 +140,8 @@ pub async fn batcher_loop(
             }
         }
 
-        // Extract prepared inputs and reply channels.
-        let mut replies: Vec<oneshot::Sender<Result<PipelineOutput, CoreError>>> =
-            Vec::with_capacity(batch.len());
-        let mut inputs: Vec<PreparedData> = Vec::with_capacity(batch.len());
-        for req in batch {
-            inputs.push(req.prepared);
-            replies.push(req.reply);
-        }
-
-        // Write-lock pipeline only during execute_batch (not during
-        // collection). The batch runs on a blocking thread, which holds the
-        // lock until it finishes.
-        let results = state
-            .run_inference(move |pipeline| pipeline.execute_batch(inputs))
-            .await;
-
-        // Fan results back to individual requests.
-        match results {
-            Ok(results) => {
-                for (reply, result) in replies.into_iter().zip(results) {
-                    let _ = reply.send(result);
-                }
-            }
-            Err(e) => {
-                for reply in replies {
-                    let _ = reply.send(Err(CoreError::Inference(e.to_string())));
-                }
-            }
-        }
+        // Run the batch on the inference worker and wait for it to finish.
+        state.run_batch(batch).await;
     }
 }
 
@@ -185,7 +162,7 @@ mod tests {
                     vec![1, 1, 1],
                     3,
                 ),
-            )).await;
+            ), None).await;
         });
 
         // Assert -- the request should appear on the receiver.
@@ -221,6 +198,7 @@ mod tests {
             );
             match batcher.tx.try_send(BatchRequest {
                 prepared,
+                deadline: None,
                 reply: reply_tx,
             }) {
                 Ok(()) => sent += 1,

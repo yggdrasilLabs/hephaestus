@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use hephaestus_core::PipelineKind;
+use hephaestus_core::{CoreError, InferenceInput, PipelineKind, PreparedData, Preparer};
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::sync::RwLock;
 
-use crate::batcher::Batcher;
+use crate::batcher::{BatchRequest, Batcher};
 use crate::error::ApiError;
+use crate::worker::{InferenceTicket, InferenceWorker};
 
 /// Shared application state for all HTTP handlers.
 ///
@@ -24,14 +25,18 @@ use crate::error::ApiError;
 pub struct AppState {
     /// The inference pipeline, guarded by a tokio RwLock.
     ///
-    /// Read lock: [`PipelineKind::prepare`] takes `&self` (tokenization only).
-    /// Write lock: [`PipelineKind::execute`] requires `&mut self` (ONNX session).
-    /// This allows concurrent tokenization across requests while serializing
-    /// inference (SC-02).
-    ///
-    /// Behind an [`Arc`] so [`AppState::run_inference`] can move an owned
-    /// write guard onto a blocking thread.
+    /// Behind an [`Arc`] shared with the inference worker thread, which
+    /// takes the write lock for every job ([`PipelineKind::execute`]
+    /// requires `&mut self`). Nothing else locks it once the server is up:
+    /// requests are prepared with `preparer`, so tokenization never waits
+    /// for a running model (SC-02).
     pipeline: Arc<RwLock<PipelineKind>>,
+
+    /// Prepares request inputs (tokenization) without the pipeline lock.
+    preparer: Preparer,
+
+    /// The thread that runs the model, and the bounded queue in front of it.
+    worker: InferenceWorker,
 
     /// Readiness flag. Starts `false`; flipped to `true` after the
     /// warmup inference pass succeeds (D-05). On SIGTERM, flipped
@@ -59,11 +64,6 @@ pub struct AppState {
 
     /// Overlap duration in seconds between consecutive audio windows (D-10).
     overlap_secs: f32,
-
-    /// Test seam: runs on the blocking thread, under the write lock, just
-    /// before the inference closure. Lets a test stand in for a slow model.
-    #[cfg(test)]
-    before_inference: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl AppState {
@@ -80,8 +80,13 @@ impl AppState {
         window_size_secs: f32,
         overlap_secs: f32,
     ) -> Self {
+        let preparer = pipeline.preparer();
+        let pipeline = Arc::new(RwLock::new(pipeline));
+        let worker = InferenceWorker::spawn(Arc::clone(&pipeline), &model_id);
         Self {
-            pipeline: Arc::new(RwLock::new(pipeline)),
+            pipeline,
+            preparer,
+            worker,
             ready: AtomicBool::new(false),
             model_id,
             start_time: Instant::now(),
@@ -90,15 +95,29 @@ impl AppState {
             batcher,
             window_size_secs,
             overlap_secs,
-            #[cfg(test)]
-            before_inference: None,
         }
     }
 
-    /// Install the test seam that runs before every inference closure.
+    /// Let at most `capacity` requests wait for the model at one time
+    /// (`INFERENCE_QUEUE_CAPACITY`). Unset, the capacity is
+    /// [`DEFAULT_QUEUE_CAPACITY`](crate::worker::DEFAULT_QUEUE_CAPACITY).
+    #[must_use]
+    pub fn with_inference_queue_capacity(self, capacity: usize) -> Self {
+        self.worker.set_capacity(capacity);
+        self
+    }
+
+    /// Install the test seam that runs on the worker thread, under the
+    /// write lock, just before every model run.
     #[cfg(test)]
-    pub(crate) fn set_before_inference(&mut self, hook: impl Fn() + Send + Sync + 'static) {
-        self.before_inference = Some(Arc::new(hook));
+    pub(crate) fn set_before_inference(&self, hook: impl Fn() + Send + Sync + 'static) {
+        self.worker.set_before_inference(hook);
+    }
+
+    /// Requests admitted to the inference queue and not yet started.
+    #[cfg(test)]
+    pub(crate) fn waiting_requests(&self) -> usize {
+        self.worker.waiting()
     }
 
     /// Check whether the service is ready to accept inference requests.
@@ -131,11 +150,29 @@ impl AppState {
         self.metrics_handle.render()
     }
 
+    /// Prepare a request's input for the model (tokenization or feature
+    /// extraction).
+    ///
+    /// Takes no lock: requests are prepared concurrently, and while the
+    /// model is running. Returns what [`PipelineKind::prepare`] returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`] if the input cannot be prepared.
+    pub fn prepare(&self, input: impl Into<InferenceInput>) -> Result<PreparedData, CoreError> {
+        self.preparer.prepare(input)
+    }
+
+    /// Whether requests to the loaded model may carry a system message.
+    pub fn accepts_system_prompt(&self) -> bool {
+        self.preparer.accepts_system_prompt()
+    }
+
     /// Acquire a shared read lock on the inference pipeline.
     ///
-    /// Used for [`PipelineKind::prepare`] which takes `&self` (tokenization).
-    /// Multiple concurrent readers are allowed, enabling parallel tokenization
-    /// across requests (SC-02).
+    /// Only for work done before the server takes requests (warmup): it
+    /// waits for as long as the model is running. Request paths use
+    /// [`AppState::prepare`] instead.
     pub async fn read_pipeline(&self) -> tokio::sync::RwLockReadGuard<'_, PipelineKind> {
         self.pipeline.read().await
     }
@@ -145,49 +182,38 @@ impl AppState {
     /// Only for short work done before the server takes requests (warmup).
     /// The guard is held on the calling task, so running a model under it
     /// blocks a runtime worker thread; request paths use
-    /// [`AppState::run_inference`] instead.
+    /// [`AppState::admit`] instead.
     pub async fn write_pipeline(&self) -> tokio::sync::RwLockWriteGuard<'_, PipelineKind> {
         self.pipeline.write().await
     }
 
-    /// Run model inference under the pipeline write lock, off the runtime.
+    /// Take a place in the inference queue for a request that must be
+    /// answered by `deadline` (`None`: no time limit).
     ///
-    /// Waits for the write lock without blocking, then runs `f` on tokio's
-    /// blocking thread pool, so a long generation never occupies a runtime
-    /// worker thread and probes, metrics and other requests keep being
-    /// served. Used for [`PipelineKind::execute`] and
-    /// [`PipelineKind::execute_batch`], which take `&mut self`.
-    ///
-    /// The blocking thread owns the write guard. If the caller stops
-    /// waiting (request timeout, client gone), `f` still runs to its end
-    /// and only then releases the lock, so there is never more than one
-    /// inference on the pipeline at a time.
-    ///
-    /// `f` runs inside the caller's tracing span.
+    /// Call this before preparing the input, so a request that cannot be
+    /// queued is refused at once. The model runs on the inference worker
+    /// thread ([`InferenceTicket::run`]), never on a runtime thread, so
+    /// probes, metrics and other requests keep being served, and there is
+    /// never more than one job on the pipeline at a time.
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError::Internal`] if the blocking task panicked or the
-    /// runtime shut down before it ran.
-    pub async fn run_inference<R, F>(&self, f: F) -> Result<R, ApiError>
-    where
-        F: FnOnce(&mut PipelineKind) -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        let mut pipeline = Arc::clone(&self.pipeline).write_owned().await;
-        let span = tracing::Span::current();
-        #[cfg(test)]
-        let before_inference = self.before_inference.clone();
-        tokio::task::spawn_blocking(move || {
-            let _entered = span.enter();
-            #[cfg(test)]
-            if let Some(hook) = before_inference {
-                hook();
-            }
-            f(&mut pipeline)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("inference task failed: {e}")))
+    /// Returns [`ApiError::QueueFull`] when the queue is at capacity.
+    pub fn admit(&self, deadline: Option<Instant>) -> Result<InferenceTicket, ApiError> {
+        self.worker.admit(deadline)
+    }
+
+    /// Run a batch collected by the dynamic batcher as one job on the
+    /// inference worker. Each request is answered on its own channel.
+    pub(crate) async fn run_batch(&self, batch: Vec<BatchRequest>) {
+        self.worker.run_batch(batch).await;
+    }
+
+    /// Begin shutdown of inference: refuse new jobs and fail the queued
+    /// ones with [`ApiError::NotReady`]. The job that is running finishes
+    /// (or stops at its deadline). Does not touch the readiness flag.
+    pub fn shutdown_inference(&self) {
+        self.worker.close();
     }
 
     /// Check whether dynamic batching is enabled.

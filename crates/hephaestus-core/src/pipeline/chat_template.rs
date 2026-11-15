@@ -41,6 +41,7 @@ const SPECIAL_TOKEN_KEYS: [&str; 7] = [
 ];
 
 /// A model's chat template, ready to render prompts.
+#[derive(Clone)]
 pub(super) struct ChatTemplate {
     environment: Environment<'static>,
     /// Special tokens by name (`bos_token`, ...), as template variables.

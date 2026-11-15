@@ -337,12 +337,31 @@ impl AsrPipeline {
     }
 }
 
-impl Pipeline for AsrPipeline {
-    type Input = Vec<f32>;
-    type Prepared = PreparedAudio;
-    type Output = String;
+/// The feature extraction settings of an ASR pipeline: everything needed
+/// to turn audio samples into the model's input, without the sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AudioFeatures {
+    /// `"mel"` for a mel spectrogram, anything else for the raw waveform.
+    feature_extractor: String,
+    n_mels: usize,
+    n_fft: usize,
+    hop_length: usize,
+}
 
-    fn prepare(&self, input: Vec<f32>) -> Result<PreparedAudio, CoreError> {
+impl AudioFeatures {
+    /// Settings for a test: the given extractor with Whisper's mel sizes.
+    #[cfg(test)]
+    pub(super) fn for_test(feature_extractor: &str) -> Self {
+        Self {
+            feature_extractor: feature_extractor.to_string(),
+            n_mels: 80,
+            n_fft: 400,
+            hop_length: 160,
+        }
+    }
+
+    /// Extract the model input from mono samples.
+    pub(super) fn extract(&self, input: Vec<f32>) -> Result<PreparedAudio, CoreError> {
         if self.feature_extractor == "mel" {
             let mel_features = crate::mel::compute_mel_spectrogram(
                 &input,
@@ -363,6 +382,28 @@ impl Pipeline for AsrPipeline {
                 features,
             })
         }
+    }
+}
+
+impl AsrPipeline {
+    /// This pipeline's feature extraction settings.
+    pub(super) fn features(&self) -> AudioFeatures {
+        AudioFeatures {
+            feature_extractor: self.feature_extractor.clone(),
+            n_mels: self.n_mels,
+            n_fft: self.n_fft,
+            hop_length: self.hop_length,
+        }
+    }
+}
+
+impl Pipeline for AsrPipeline {
+    type Input = Vec<f32>;
+    type Prepared = PreparedAudio;
+    type Output = String;
+
+    fn prepare(&self, input: Vec<f32>) -> Result<PreparedAudio, CoreError> {
+        self.features().extract(input)
     }
 
     fn execute(&mut self, prepared: PreparedAudio) -> Result<String, CoreError> {

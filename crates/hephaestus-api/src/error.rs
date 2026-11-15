@@ -9,6 +9,8 @@ use axum::response::{IntoResponse, Response};
 use hephaestus_core::CoreError;
 use thiserror::Error;
 
+use crate::worker::QUEUE_FULL_RETRY_AFTER_SECS;
+
 /// Errors produced by the HTTP serving layer.
 ///
 /// Each variant maps to a specific HTTP status code and a machine-parseable
@@ -34,6 +36,10 @@ pub enum ApiError {
     /// Service not ready -- warmup not complete or shutdown in progress (maps to 503).
     #[error("service not ready")]
     NotReady,
+
+    /// The inference queue is at capacity (maps to 503 with `Retry-After`).
+    #[error("inference queue full")]
+    QueueFull,
 
     /// Client sent an invalid request (maps to 400 Bad Request).
     #[error("bad request: {0}")]
@@ -63,6 +69,10 @@ impl From<ApiError> for tonic::Status {
     fn from(err: ApiError) -> Self {
         match err {
             ApiError::NotReady => tonic::Status::unavailable("service not ready"),
+            // UNAVAILABLE, like the HTTP 503: transient, and the code that
+            // clients and meshes retry with backoff. RESOURCE_EXHAUSTED
+            // reads as a per-caller quota and is usually not retried.
+            ApiError::QueueFull => tonic::Status::unavailable("inference queue full"),
             ApiError::BadRequest(msg) => tonic::Status::invalid_argument(msg),
             ApiError::Tokenization(msg) => {
                 tonic::Status::invalid_argument(format!("tokenization failed: {msg}"))
@@ -94,6 +104,7 @@ impl IntoResponse for ApiError {
             Self::Model(_) => (StatusCode::INTERNAL_SERVER_ERROR, "MODEL_ERROR"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "INFERENCE_TIMEOUT"),
             Self::NotReady => (StatusCode::SERVICE_UNAVAILABLE, "NOT_READY"),
+            Self::QueueFull => (StatusCode::SERVICE_UNAVAILABLE, "QUEUE_FULL"),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
         };
@@ -119,7 +130,14 @@ impl IntoResponse for ApiError {
             }
         });
 
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        if matches!(self, Self::QueueFull) {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(QUEUE_FULL_RETRY_AFTER_SECS),
+            );
+        }
+        response
     }
 }
 
@@ -171,6 +189,30 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"]["code"], "NOT_READY");
+    }
+
+    #[tokio::test]
+    async fn api_error_queue_full_maps_to_503_with_retry_after() {
+        // Arrange
+        let err = ApiError::QueueFull;
+
+        // Act
+        let response = err.into_response();
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "1");
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "QUEUE_FULL");
+        assert_eq!(json["error"]["message"], "inference queue full");
+    }
+
+    #[test]
+    fn api_error_queue_full_to_grpc_unavailable() {
+        let status: tonic::Status = ApiError::QueueFull.into();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "inference queue full");
     }
 
     #[tokio::test]

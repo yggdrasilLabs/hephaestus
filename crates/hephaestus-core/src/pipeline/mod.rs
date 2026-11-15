@@ -5,6 +5,7 @@ mod chat_template;
 mod classifier;
 mod embeddings;
 mod encoder_decoder;
+mod preparer;
 mod seq2seq;
 mod text_generation;
 mod token_classifier;
@@ -12,6 +13,7 @@ mod token_classifier;
 pub use asr::AsrPipeline;
 pub use classifier::ClassifierPipeline;
 pub use embeddings::EmbeddingsPipeline;
+pub use preparer::Preparer;
 pub use encoder_decoder::{SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS};
 pub use seq2seq::{Seq2SeqOptions, Seq2SeqPipeline};
 pub use text_generation::{

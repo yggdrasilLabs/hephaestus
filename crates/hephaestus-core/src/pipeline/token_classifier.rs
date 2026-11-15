@@ -55,31 +55,39 @@ impl TokenClassifierPipeline {
     }
 }
 
+/// Tokenize text for token classification: like every text pipeline, but
+/// the encoding is kept for merging subword tokens into words.
+pub(super) fn tokenize_keeping_encoding(
+    tokenizer: &Tokenizer,
+    input: String,
+) -> Result<PreparedInput, CoreError> {
+    let encoding = tokenizer
+        .encode(input.as_str(), true)
+        .map_err(|e| CoreError::Tokenization(e.to_string()))?;
+
+    let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
+    let attention_mask: Vec<i64> = encoding
+        .get_attention_mask()
+        .iter()
+        .map(|&m| i64::from(m))
+        .collect();
+    let sequence_length = encoding.len();
+
+    Ok(PreparedInput {
+        input_ids,
+        attention_mask,
+        sequence_length,
+        encoding: Some(encoding),
+    })
+}
+
 impl Pipeline for TokenClassifierPipeline {
     type Input = String;
     type Prepared = PreparedInput;
     type Output = Vec<Entity>;
 
     fn prepare(&self, input: String) -> Result<PreparedInput, CoreError> {
-        let encoding = self
-            .tokenizer
-            .encode(input.as_str(), true)
-            .map_err(|e| CoreError::Tokenization(e.to_string()))?;
-
-        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
-        let attention_mask: Vec<i64> = encoding
-            .get_attention_mask()
-            .iter()
-            .map(|&m| i64::from(m))
-            .collect();
-        let sequence_length = encoding.len();
-
-        Ok(PreparedInput {
-            input_ids,
-            attention_mask,
-            sequence_length,
-            encoding: Some(encoding),
-        })
+        tokenize_keeping_encoding(&self.tokenizer, input)
     }
 
     fn execute(

@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 
-use hephaestus_core::{InferenceInput, PipelineKind};
+use hephaestus_core::InferenceInput;
 
 use crate::error::ApiError;
 use crate::metrics::StageTimer;
@@ -42,11 +42,11 @@ pub struct InferRequest {
 /// Returns [`ApiError::BadRequest`] if a text generation request carries
 /// a `system` value that is not a string.
 fn request_input(
-    pipeline: &PipelineKind,
+    state: &AppState,
     text: String,
     system: Option<serde_json::Value>,
 ) -> Result<InferenceInput, ApiError> {
-    if !pipeline.accepts_system_prompt() {
+    if !state.accepts_system_prompt() {
         return Ok(InferenceInput::Text(text));
     }
     match system {
@@ -62,8 +62,8 @@ fn request_input(
 
 /// POST /infer -- run inference on the loaded model.
 ///
-/// Validates readiness, acquires the pipeline lock, runs tokenization
-/// and inference, and returns a model-determined JSON result (D-04, D-05).
+/// Validates readiness, tokenizes the input, queues it for the inference
+/// worker, and returns a model-determined JSON result (D-04, D-05).
 ///
 /// The response shape depends on the loaded model profile:
 /// - Classifier: `{"label": "...", "score": ..., "model_id": "...", "latency_ms": ...}`
@@ -73,7 +73,8 @@ fn request_input(
 /// # Errors
 ///
 /// Returns [`ApiError`] variants mapped to HTTP status codes per D-03:
-/// - 503 if the service is not ready
+/// - 503 if the service is not ready, or (with `Retry-After`) if the
+///   inference queue is full
 /// - 400 if the request text is empty
 /// - 422 if tokenization fails
 /// - 504 if inference times out (D-14)
@@ -95,45 +96,35 @@ pub async fn infer(
 
     let request_start = Instant::now();
     let timer = StageTimer::new(state.model_id());
+    // A job still queued at this moment is dropped instead of run.
+    let deadline = request_start + state.request_timeout();
 
     // Wrap inference in a request-level timeout (D-12, D-14, CORE-04).
     // Uses tokio::time::timeout (not tower-http TimeoutLayer) for full
     // control over the 504 response body per Pitfall 4.
     let result = tokio::time::timeout(state.request_timeout(), async {
         if state.is_batching_enabled() {
-            // Batching path (D-06): prepare under read lock, drop lock, submit to batcher.
-            // Pipeline RwLock is NOT held across the batcher submit await
-            // per rules/anti-lock-across-await.md.
-            let prepared = {
-                let pipeline = state.read_pipeline().await;
-                let input = request_input(&pipeline, req.text, req.system)?;
-                timer.time("tokenization", || pipeline.prepare(input))?
-            }; // Read lock dropped here before submit.
+            // Batching path (D-06): prepare, then submit to the batcher.
+            let input = request_input(&state, req.text, req.system)?;
+            let prepared = timer.time("tokenization", || state.prepare(input))?;
 
             let pipeline_output = state
                 .batcher()
                 .ok_or(ApiError::Internal("batcher not available".to_string()))?
-                .submit(prepared)
-                .await
-                .map_err(ApiError::from)?;
+                .submit(prepared, Some(deadline))
+                .await?;
             Ok::<_, ApiError>(pipeline_output.to_json())
         } else {
-            // Direct path (D-07): read lock for prepare, write lock for execute.
-            // Splitting the lock allows other requests to tokenize concurrently
-            // while only inference holds exclusive access (SC-02).
-            let prepared = {
-                let pipeline = state.read_pipeline().await;
-                let input = request_input(&pipeline, req.text, req.system)?;
-                timer.time("tokenization", || pipeline.prepare(input))?
-            }; // Read lock dropped here.
-            // The model runs on a blocking thread, which holds the write
-            // lock until it finishes, so this task only waits.
-            let stage_timer = timer.clone();
-            let pipeline_output = state
-                .run_inference(move |pipeline| {
-                    stage_timer.time("inference", || pipeline.execute(prepared))
-                })
-                .await??;
+            // Direct path (D-07): take a place in the inference queue first,
+            // so a request that cannot be queued is refused at once, then
+            // prepare. Neither waits for a running model (SC-02).
+            let ticket = state.admit(Some(deadline))?;
+            let input = request_input(&state, req.text, req.system)?;
+            let prepared = timer.time("tokenization", || state.prepare(input))?;
+            // The model runs on the inference worker thread, so this task
+            // only waits. Dropping this future (timeout, client gone)
+            // takes a job that is still queued out of the queue.
+            let pipeline_output = ticket.run(prepared, Some(timer.clone())).await?;
             Ok::<_, ApiError>(pipeline_output.to_json())
         }
     })
@@ -235,23 +226,23 @@ pub async fn readiness(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use axum::body::Body;
     use axum::http::Request;
-    use hephaestus_core::{ExecutionProvider, Seq2SeqPipeline};
+    use axum::response::Response;
+    use hephaestus_core::{ExecutionProvider, PipelineKind, Seq2SeqPipeline};
     use tower::ServiceExt;
 
     use super::*;
+    use crate::batcher::{Batcher, batcher_loop};
 
-    /// State around a real (tiny) encoder-decoder pipeline, built from the
-    /// fixture graphs of `hephaestus-core`. `before_inference` runs on the
-    /// inference thread before each run, to stand in for a slow model.
-    fn fixture_state(
-        request_timeout: Duration,
-        before_inference: impl Fn() + Send + Sync + 'static,
-    ) -> (Arc<AppState>, tempfile::TempDir) {
+    /// A real (tiny) encoder-decoder pipeline, built from the fixture
+    /// graphs of `hephaestus-core`. It generates its input back.
+    fn seq2seq_pipeline() -> (PipelineKind, tempfile::TempDir) {
         let fixtures =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../hephaestus-core/tests/fixtures/seq2seq");
         let dir = tempfile::tempdir().expect("temp dir");
@@ -271,23 +262,74 @@ mod tests {
         std::fs::write(dir.path().join("config.json"), config.to_string()).expect("write config");
         let pipeline = Seq2SeqPipeline::new(dir.path(), &ExecutionProvider::Cpu)
             .expect("pipeline should load");
+        (PipelineKind::Seq2Seq(pipeline), dir)
+    }
 
+    /// Ready state around `pipeline`.
+    fn state_for(
+        pipeline: PipelineKind,
+        request_timeout: Duration,
+        batcher: Option<Batcher>,
+    ) -> AppState {
         // A recorder that is not installed globally: only its handle is needed.
         let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
             .build_recorder()
             .handle();
-        let mut state = AppState::new(
-            PipelineKind::Seq2Seq(pipeline),
-            "fixture/seq2seq".to_string(),
+        let state = AppState::new(
+            pipeline,
+            "fixture/model".to_string(),
             request_timeout,
             metrics_handle,
-            None,
+            batcher,
             30.0,
             5.0,
         );
-        state.set_before_inference(before_inference);
         state.set_ready(true);
+        state
+    }
+
+    /// State around the seq2seq fixture. `before_inference` runs on the
+    /// inference thread before each run, to stand in for a slow model.
+    fn fixture_state(
+        request_timeout: Duration,
+        before_inference: impl Fn() + Send + Sync + 'static,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
+        let (pipeline, dir) = seq2seq_pipeline();
+        let state = state_for(pipeline, request_timeout, None);
+        state.set_before_inference(before_inference);
         (Arc::new(state), dir)
+    }
+
+    /// A hook that holds every model run until the test lets it go.
+    ///
+    /// Returns the hook, the number of runs that have started, and the
+    /// sender that releases one run per message (dropping it releases all).
+    fn gated_hook() -> (
+        impl Fn() + Send + Sync + 'static,
+        Arc<AtomicUsize>,
+        mpsc::Sender<()>,
+    ) {
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let started = Arc::new(AtomicUsize::new(0));
+        let hook_started = Arc::clone(&started);
+        let hook = move || {
+            hook_started.fetch_add(1, Ordering::SeqCst);
+            let _ = gate.lock().expect("gate lock").recv();
+        };
+        (hook, started, release)
+    }
+
+    /// Wait until `condition` holds, failing the test if it never does.
+    async fn until(what: &str, condition: impl Fn() -> bool) {
+        let asked = Instant::now();
+        while !condition() {
+            assert!(
+                asked.elapsed() < Duration::from_secs(10),
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
     }
 
     fn infer_request(text: &str) -> Request<Body> {
@@ -301,6 +343,13 @@ mod tests {
         Request::get(path)
             .body(Body::empty())
             .expect("request should build")
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        serde_json::from_slice(&body).expect("JSON body")
     }
 
     // A single-threaded runtime: if inference ran on the runtime thread,
@@ -346,16 +395,13 @@ mod tests {
         // The generation itself is unaffected.
         let response = infer.await.expect("task should join").expect("infallible");
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should read");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        let body = json_body(response).await;
         assert_eq!(body["generated_text"], "a b c");
-        assert_eq!(body["model_id"], "fixture/seq2seq");
+        assert_eq!(body["model_id"], "fixture/model");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn timed_out_request_keeps_the_pipeline_locked_until_its_inference_ends() {
+    async fn timed_out_request_keeps_the_worker_busy_until_its_inference_ends() {
         // Arrange -- inference outlasts the request timeout; the hook
         // counts how many inferences run at the same moment.
         let running = Arc::new(AtomicUsize::new(0));
@@ -384,16 +430,14 @@ mod tests {
         let timed_out_after = asked.elapsed();
         let abandoned_still_running = running.load(Ordering::SeqCst) == 1;
         // A second inference, with no timeout of its own, must wait for it.
+        let ticket = state.admit(None).expect("queue has room");
         let prepared = state
-            .read_pipeline()
-            .await
             .prepare("d e f".to_string())
             .expect("prepare should succeed");
-        let output = state
-            .run_inference(move |pipeline| pipeline.execute(prepared))
+        let output = ticket
+            .run(prepared, None)
             .await
-            .expect("inference task should finish")
-            .expect("execute should succeed");
+            .expect("inference should succeed");
 
         // Assert
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
@@ -411,6 +455,261 @@ mod tests {
             output.to_json(),
             serde_json::json!({ "generated_text": "d e f" })
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_queue_is_refused_at_once_with_retry_after() {
+        // Arrange -- room for one waiting request; the model is held.
+        let (hook, started, release) = gated_hook();
+        let (pipeline, _dir) = seq2seq_pipeline();
+        let state = state_for(pipeline, Duration::from_secs(30), None)
+            .with_inference_queue_capacity(1);
+        state.set_before_inference(hook);
+        let state = Arc::new(state);
+        let app = crate::build_router(Arc::clone(&state));
+
+        // Act -- one request running, one waiting, then a third.
+        let first = tokio::spawn(app.clone().oneshot(infer_request("a b c")));
+        until("the first run", || started.load(Ordering::SeqCst) == 1).await;
+        let second = tokio::spawn(app.clone().oneshot(infer_request("d e f")));
+        until("the second request to queue", || {
+            state.waiting_requests() == 1
+        })
+        .await;
+        let asked = Instant::now();
+        let third = app
+            .clone()
+            .oneshot(infer_request("g h i"))
+            .await
+            .expect("infallible");
+        let refused_in = asked.elapsed();
+
+        // Assert -- refused without waiting for the model.
+        assert_eq!(third.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(third.headers()["retry-after"], "1");
+        assert!(refused_in < Duration::from_secs(1), "503 after {refused_in:?}");
+        let body = json_body(third).await;
+        assert_eq!(body["error"]["code"], "QUEUE_FULL");
+        assert_eq!(started.load(Ordering::SeqCst), 1, "only one run started");
+
+        // The two accepted requests are served once the model is free.
+        drop(release);
+        for (request, expected) in [(first, "a b c"), (second, "d e f")] {
+            let response = request.await.expect("task should join").expect("infallible");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["generated_text"], expected);
+        }
+        assert_eq!(state.waiting_requests(), 0);
+        // With the queue empty again, a new request is accepted.
+        let response = app.oneshot(infer_request("j k l")).await.expect("infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_that_times_out_in_the_queue_never_runs() {
+        // Arrange -- the first run outlasts the request timeout.
+        let runs = Arc::new(AtomicUsize::new(0));
+        let hook_runs = Arc::clone(&runs);
+        let (state, _dir) = fixture_state(Duration::from_millis(150), move || {
+            if hook_runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(600));
+            }
+        });
+        let app = crate::build_router(Arc::clone(&state));
+
+        // Act -- the second request waits behind the first and times out
+        // there.
+        let first = tokio::spawn(app.clone().oneshot(infer_request("a b c")));
+        until("the first run", || runs.load(Ordering::SeqCst) == 1).await;
+        let second = app
+            .clone()
+            .oneshot(infer_request("d e f"))
+            .await
+            .expect("infallible");
+        let queue_after_timeout = state.waiting_requests();
+        let first = first.await.expect("task should join").expect("infallible");
+        // A request sent once the model is free again runs normally.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let third = app.oneshot(infer_request("g h i")).await.expect("infallible");
+
+        // Assert
+        assert_eq!(first.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(second.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(queue_after_timeout, 0, "the dead job left the queue");
+        assert_eq!(third.status(), StatusCode::OK);
+        assert_eq!(json_body(third).await["generated_text"], "g h i");
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "the queued request never ran");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn job_past_its_deadline_is_answered_with_a_timeout_and_not_run() {
+        // Arrange -- a caller that keeps waiting past its deadline.
+        let runs = Arc::new(AtomicUsize::new(0));
+        let hook_runs = Arc::clone(&runs);
+        let (state, _dir) = fixture_state(Duration::from_secs(30), move || {
+            hook_runs.fetch_add(1, Ordering::SeqCst);
+        });
+        let ticket = state
+            .admit(Some(Instant::now()))
+            .expect("queue has room");
+        let prepared = state
+            .prepare("a b c".to_string())
+            .expect("prepare should succeed");
+
+        // Act
+        let result = ticket.run(prepared, None).await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::Timeout)));
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(state.waiting_requests(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_request_whose_caller_goes_away_never_runs() {
+        // Arrange -- the model is held by a first request.
+        let (hook, started, release) = gated_hook();
+        let (state, _dir) = fixture_state(Duration::from_secs(30), hook);
+        let app = crate::build_router(Arc::clone(&state));
+        let first = tokio::spawn(app.clone().oneshot(infer_request("a b c")));
+        until("the first run", || started.load(Ordering::SeqCst) == 1).await;
+
+        // Act -- a second request queues, then its client disconnects
+        // (axum drops the handler future).
+        let second = tokio::spawn(app.clone().oneshot(infer_request("d e f")));
+        until("the second request to queue", || {
+            state.waiting_requests() == 1
+        })
+        .await;
+        second.abort();
+        until("the dead job to leave the queue", || {
+            state.waiting_requests() == 0
+        })
+        .await;
+        drop(release);
+        let first = first.await.expect("task should join").expect("infallible");
+        let third = app.oneshot(infer_request("g h i")).await.expect("infallible");
+
+        // Assert -- only the first and third requests ran.
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(third.status(), StatusCode::OK);
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn never_more_than_one_job_runs_at_once() {
+        // Arrange -- the hook counts how many runs overlap.
+        let running = Arc::new(AtomicUsize::new(0));
+        let most_at_once = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (hook_running, hook_most, hook_runs) = (
+            Arc::clone(&running),
+            Arc::clone(&most_at_once),
+            Arc::clone(&runs),
+        );
+        let (state, _dir) = fixture_state(Duration::from_secs(30), move || {
+            let now = hook_running.fetch_add(1, Ordering::SeqCst) + 1;
+            hook_most.fetch_max(now, Ordering::SeqCst);
+            hook_runs.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
+            hook_running.fetch_sub(1, Ordering::SeqCst);
+        });
+        let app = crate::build_router(state);
+        let texts = ["a", "b c", "d e f", "g", "h i", "j k l", "a c e", "b d"];
+
+        // Act -- eight requests at the same time.
+        let requests: Vec<_> = texts
+            .iter()
+            .map(|text| tokio::spawn(app.clone().oneshot(infer_request(text))))
+            .collect();
+
+        // Assert -- every request got its own answer, one run at a time.
+        for (request, text) in requests.into_iter().zip(texts) {
+            let response = request.await.expect("task should join").expect("infallible");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["generated_text"], text);
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), texts.len());
+        assert_eq!(most_at_once.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_fails_queued_jobs_and_lets_the_running_one_finish() {
+        // Arrange -- one request running (held), two waiting.
+        let (hook, started, release) = gated_hook();
+        let (state, _dir) = fixture_state(Duration::from_secs(30), hook);
+        let app = crate::build_router(Arc::clone(&state));
+        let running = tokio::spawn(app.clone().oneshot(infer_request("a b c")));
+        until("the first run", || started.load(Ordering::SeqCst) == 1).await;
+        let queued: Vec<_> = ["d e f", "g h i"]
+            .iter()
+            .map(|text| tokio::spawn(app.clone().oneshot(infer_request(text))))
+            .collect();
+        until("two requests to queue", || state.waiting_requests() == 2).await;
+
+        // Act -- shutdown begins while the model is still held.
+        state.shutdown_inference();
+        let mut queued_statuses = Vec::new();
+        for request in queued {
+            let response = request.await.expect("task should join").expect("infallible");
+            queued_statuses.push((response.status(), json_body(response).await));
+        }
+        let running_was_unfinished = !running.is_finished();
+        // Readiness is the caller's to flip; a request that still gets in
+        // is refused by the closed queue.
+        let late = app.clone().oneshot(infer_request("j k l")).await.expect("infallible");
+        drop(release);
+        let running = running.await.expect("task should join").expect("infallible");
+
+        // Assert
+        for (status, body) in queued_statuses {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["error"]["code"], "NOT_READY");
+        }
+        assert!(running_was_unfinished, "queued jobs failed before the running one ended");
+        assert_eq!(late.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(state.is_ready(), "shutdown_inference leaves readiness alone");
+        assert_eq!(running.status(), StatusCode::OK);
+        assert_eq!(json_body(running).await["generated_text"], "a b c");
+        assert_eq!(started.load(Ordering::SeqCst), 1, "queued jobs never ran");
+        assert_eq!(state.waiting_requests(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batched_requests_run_through_the_worker() {
+        // Arrange -- batching on: requests go batcher -> worker.
+        let runs = Arc::new(AtomicUsize::new(0));
+        let hook_runs = Arc::clone(&runs);
+        let (pipeline, _dir) = seq2seq_pipeline();
+        let (batcher, receiver) = Batcher::new(4);
+        let state = state_for(pipeline, Duration::from_secs(30), Some(batcher));
+        state.set_before_inference(move || {
+            hook_runs.fetch_add(1, Ordering::SeqCst);
+        });
+        let state = Arc::new(state);
+        let batcher_task = tokio::spawn(batcher_loop(
+            receiver,
+            Arc::clone(&state),
+            4,
+            Duration::from_millis(200),
+        ));
+        let app = crate::build_router(Arc::clone(&state));
+        let texts = ["a b c", "d e", "f", "g h i j"];
+
+        // Act -- four requests at once fill one batch.
+        let requests: Vec<_> = texts
+            .iter()
+            .map(|text| tokio::spawn(app.clone().oneshot(infer_request(text))))
+            .collect();
+
+        // Assert -- each got its own answer, from a single job.
+        for (request, text) in requests.into_iter().zip(texts) {
+            let response = request.await.expect("task should join").expect("infallible");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["generated_text"], text);
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "one batch, one job");
+        batcher_task.abort();
     }
 
     #[test]

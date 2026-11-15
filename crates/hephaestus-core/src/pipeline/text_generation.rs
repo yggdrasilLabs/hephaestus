@@ -544,6 +544,71 @@ fn ensure_before(deadline: Option<Instant>, generated: usize) -> Result<(), Core
     }
 }
 
+/// Everything needed to turn a request into a tokenized prompt.
+///
+/// Split from the pipeline so requests can be prepared while the model is
+/// running; a clone prepares exactly what the pipeline would.
+#[derive(Clone)]
+pub(super) struct PromptBuilder {
+    tokenizer: Tokenizer,
+    template: ChatTemplate,
+    /// Cap on prompt tokens.
+    max_input_tokens: usize,
+    /// System message of requests that bring none.
+    system_prompt: Option<String>,
+}
+
+impl PromptBuilder {
+    /// Render and tokenize the prompt, shortening the user message when
+    /// the prompt is above the input cap.
+    pub(super) fn prepare(&self, input: TextGenerationInput) -> Result<PreparedInput, CoreError> {
+        let system = match input.system {
+            Some(system) => Some(system).filter(|system| !system.is_empty()),
+            None => self.system_prompt.clone(),
+        };
+        let cap = self.max_input_tokens;
+        let mut text = input.text;
+
+        for _ in 0..MAX_TRUNCATION_PASSES {
+            let prompt = self.template.render(system.as_deref(), &text)?;
+            // The template writes every special token itself.
+            let encoding = self
+                .tokenizer
+                .encode(prompt.as_str(), false)
+                .map_err(|e| CoreError::Tokenization(e.to_string()))?;
+            let length = encoding.len();
+            if length == 0 {
+                return Err(CoreError::InvalidInput(
+                    "chat template rendered an empty prompt".to_string(),
+                ));
+            }
+            if length <= cap {
+                return Ok(PreparedInput {
+                    input_ids: encoding.get_ids().iter().map(|&id| i64::from(id)).collect(),
+                    attention_mask: vec![1; length],
+                    sequence_length: length,
+                    encoding: None,
+                });
+            }
+            text = shorten_user_text(&prompt, encoding.get_offsets(), &text, length - cap)
+                .ok_or_else(|| {
+                    CoreError::InvalidInput(format!(
+                        "prompt has {length} tokens, more than the limit of {cap}, and cannot \
+                         be shortened by cutting the user text",
+                    ))
+                })?;
+            tracing::debug!(
+                prompt_tokens = length,
+                max_input_tokens = cap,
+                "prompt above the input cap; user text truncated"
+            );
+        }
+        Err(CoreError::InvalidInput(format!(
+            "prompt does not fit the limit of {cap} tokens",
+        )))
+    }
+}
+
 /// Text generation pipeline for decoder-only instruction models.
 ///
 /// The model directory must contain:
@@ -555,14 +620,10 @@ fn ensure_before(deadline: Option<Instant>, generated: usize) -> Result<(), Core
 ///   `tokenizer_config.json`
 pub struct TextGenerationPipeline {
     session: Session,
-    tokenizer: Tokenizer,
-    template: ChatTemplate,
+    /// Turns requests into prompts; also decodes the generated tokens.
+    prompt: PromptBuilder,
     io: GraphIo,
     settings: GenerationSettings,
-    /// Cap on prompt tokens.
-    max_input_tokens: usize,
-    /// System message of requests that bring none.
-    system_prompt: Option<String>,
     /// Time budget for one request.
     timeout: Option<Duration>,
     /// Whether generation keeps a key/value cache between steps.
@@ -643,12 +704,14 @@ impl TextGenerationPipeline {
 
         let pipeline = Self {
             session,
-            tokenizer,
-            template,
+            prompt: PromptBuilder {
+                tokenizer,
+                template,
+                max_input_tokens,
+                system_prompt: options.system_prompt.clone(),
+            },
             io,
             settings,
-            max_input_tokens,
-            system_prompt: options.system_prompt.clone(),
             timeout: options.timeout,
             kv_cache,
             empty_past,
@@ -668,7 +731,7 @@ impl TextGenerationPipeline {
             eos_token_ids = ?pipeline.settings.eos_token_ids,
             repetition_penalty = pipeline.settings.repetition_penalty,
             no_repeat_ngram_size = pipeline.settings.no_repeat_ngram_size,
-            default_system_prompt = pipeline.system_prompt.is_some(),
+            default_system_prompt = pipeline.prompt.system_prompt.is_some(),
             "text generation pipeline loaded (greedy decoding)"
         );
         if pipeline.settings.eos_token_ids.is_empty() {
@@ -730,53 +793,16 @@ impl TextGenerationPipeline {
         self.timeout.map(|timeout| Instant::now() + timeout)
     }
 
+    /// The part of the pipeline that prepares requests, for use without
+    /// the pipeline itself (it holds no ONNX session).
+    pub(super) fn prompt_builder(&self) -> PromptBuilder {
+        self.prompt.clone()
+    }
+
     /// Render and tokenize the prompt, shortening the user message when
     /// the prompt is above the input cap.
     fn prepare_prompt(&self, input: TextGenerationInput) -> Result<PreparedInput, CoreError> {
-        let system = match input.system {
-            Some(system) => Some(system).filter(|system| !system.is_empty()),
-            None => self.system_prompt.clone(),
-        };
-        let cap = self.max_input_tokens;
-        let mut text = input.text;
-
-        for _ in 0..MAX_TRUNCATION_PASSES {
-            let prompt = self.template.render(system.as_deref(), &text)?;
-            // The template writes every special token itself.
-            let encoding = self
-                .tokenizer
-                .encode(prompt.as_str(), false)
-                .map_err(|e| CoreError::Tokenization(e.to_string()))?;
-            let length = encoding.len();
-            if length == 0 {
-                return Err(CoreError::InvalidInput(
-                    "chat template rendered an empty prompt".to_string(),
-                ));
-            }
-            if length <= cap {
-                return Ok(PreparedInput {
-                    input_ids: encoding.get_ids().iter().map(|&id| i64::from(id)).collect(),
-                    attention_mask: vec![1; length],
-                    sequence_length: length,
-                    encoding: None,
-                });
-            }
-            text = shorten_user_text(&prompt, encoding.get_offsets(), &text, length - cap)
-                .ok_or_else(|| {
-                    CoreError::InvalidInput(format!(
-                        "prompt has {length} tokens, more than the limit of {cap}, and cannot \
-                         be shortened by cutting the user text",
-                    ))
-                })?;
-            tracing::debug!(
-                prompt_tokens = length,
-                max_input_tokens = cap,
-                "prompt above the input cap; user text truncated"
-            );
-        }
-        Err(CoreError::InvalidInput(format!(
-            "prompt does not fit the limit of {cap} tokens",
-        )))
+        self.prompt.prepare(input)
     }
 
     /// Generate and decode the reply for one prepared prompt.
@@ -787,7 +813,8 @@ impl TextGenerationPipeline {
     ) -> Result<String, CoreError> {
         let max_new_tokens = self.settings.max_new_tokens;
         let generated = self.generate(prepared, deadline, max_new_tokens, &mut |_| {})?;
-        self.tokenizer
+        self.prompt
+            .tokenizer
             .decode(&generated, true)
             .map_err(|e| CoreError::Inference(e.to_string()))
     }
@@ -1395,6 +1422,7 @@ mod tests {
             // Act
             let system = input.system.clone();
             let prompt = cached
+                .prompt
                 .template
                 .render(system.as_deref(), &input.text)
                 .expect("render");
@@ -1422,7 +1450,7 @@ mod tests {
                 })
                 .expect("generate without cache");
             let uncached_ms = started.elapsed().as_secs_f64() * 1000.0;
-            let text = cached.tokenizer.decode(&generated, true).expect("decode");
+            let text = cached.prompt.tokenizer.decode(&generated, true).expect("decode");
             println!(
                 "{name}: {} prompt tokens, {} generated in {cached_ms:.0} ms; first {steps} steps \
                  without cache {uncached_ms:.0} ms, max |logit difference| {max_logit_diff:.2e}",
