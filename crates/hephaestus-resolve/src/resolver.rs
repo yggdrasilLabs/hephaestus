@@ -117,6 +117,12 @@ impl<F: ForgeClient> ModelResolver<F> {
     /// Returns the path to a directory containing `model.onnx` (or
     /// `onnx/model.onnx`), `tokenizer.json`, and `config.json`.
     ///
+    /// Each tier looks for that single-file layout first. Only when it
+    /// misses does the tier look for an encoder-decoder (seq2seq) export:
+    /// `encoder_model.onnx` plus a decoder graph, in the same directory
+    /// conventions. A model with a `model.onnx` therefore resolves exactly
+    /// as it did before the second layout was supported.
+    ///
     /// Validates the model ID before any tier logic (T-03-01).
     pub async fn resolve(&self, model_id: &str) -> Result<PathBuf, ResolveError> {
         // T-03-01: validate model ID before any tier logic.
@@ -124,8 +130,7 @@ impl<F: ForgeClient> ModelResolver<F> {
 
         // Tier 1: Storage cache (D-05). RetryLayer on the Operator handles retries.
         if let Some(op) = &self.operator {
-            let storage_result =
-                storage::download_model(op, model_id, &self.cache_dir).await;
+            let storage_result = download_from_storage(op, model_id, &self.cache_dir).await;
 
             match storage_result {
                 Ok(Some(path)) => {
@@ -164,12 +169,46 @@ impl<F: ForgeClient> ModelResolver<F> {
                 return Ok(model_dir);
             }
             Err(ResolveError::NoOnnxExport { .. }) => {
-                tracing::info!(
-                    model_id,
-                    tier = "huggingface",
-                    "no ONNX export found, falling through to Forge"
-                );
-                // Fall through to Forge tier.
+                // No single-file model: look for an encoder-decoder export
+                // before giving up on HuggingFace.
+                let model_id_owned = model_id.to_string();
+                let export_result = with_retry(3, Duration::from_millis(500), move || {
+                    let id = model_id_owned.clone();
+                    async move { hf::download_encoder_decoder_from_hf(&id).await }
+                })
+                .await;
+
+                match export_result {
+                    Ok(model_dir) => {
+                        tracing::info!(
+                            model_id,
+                            tier = "huggingface",
+                            model_dir = %model_dir.display(),
+                            "encoder-decoder model resolved from HuggingFace"
+                        );
+                        self.spawn_cache_back(model_id, &model_dir);
+                        return Ok(model_dir);
+                    }
+                    Err(ResolveError::NoOnnxExport { .. }) => {
+                        tracing::info!(
+                            model_id,
+                            tier = "huggingface",
+                            "no ONNX export found, falling through to Forge"
+                        );
+                        // Fall through to Forge tier.
+                    }
+                    Err(e) => {
+                        // The single-file lookup already sent this model
+                        // to Forge; a failed extra lookup must not turn
+                        // that into a resolution error.
+                        tracing::warn!(
+                            model_id,
+                            tier = "huggingface",
+                            error = %e,
+                            "encoder-decoder lookup failed, falling through to Forge"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 return Err(e);
@@ -195,7 +234,7 @@ impl<F: ForgeClient> ModelResolver<F> {
 
                 if let Some(op) = &self.operator {
                     let download_result =
-                        storage::download_model(op, model_id, &self.cache_dir).await?;
+                        download_from_storage(op, model_id, &self.cache_dir).await?;
 
                     if let Some(path) = download_result {
                         tracing::info!(
@@ -252,6 +291,23 @@ impl<F: ForgeClient> ModelResolver<F> {
             }
         });
     }
+}
+
+/// Download a model from the storage cache, whichever layout it is stored in.
+///
+/// Runs the single-file lookup ([`storage::download_model`]) first and
+/// returns its result untouched on a hit or an error. Only a miss leads to
+/// the encoder-decoder lookup, so a model stored with a `model.onnx` is
+/// fetched by the same code, in the same way, as before.
+async fn download_from_storage(
+    op: &opendal::Operator,
+    model_id: &str,
+    cache_dir: &Path,
+) -> Result<Option<PathBuf>, ResolveError> {
+    if let Some(path) = storage::download_model(op, model_id, cache_dir).await? {
+        return Ok(Some(path));
+    }
+    storage::download_encoder_decoder_model(op, model_id, cache_dir).await
 }
 
 /// Trait for errors that can distinguish transient from permanent failures.
@@ -638,5 +694,125 @@ mod tests {
             result.unwrap_err(),
             ResolveError::ForgeUnavailable { ref model_id } if model_id == "some/model"
         ));
+    }
+
+    // --- Storage layout order tests ---
+
+    /// Write `{model_id}/{name}` for every name, with the name as content.
+    async fn write_model_files(op: &opendal::Operator, model_id: &str, names: &[&str]) {
+        for name in names {
+            op.write(&format!("{model_id}/{name}"), name.as_bytes().to_vec())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Names of the files directly inside `dir`, sorted.
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn storage_lookup_takes_single_file_model_when_both_layouts_exist() {
+        // Arrange -- a model stored in both layouts.
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        write_model_files(
+            &op,
+            "org/model",
+            &[
+                "model.onnx",
+                "encoder_model.onnx",
+                "decoder_model.onnx",
+                "generation_config.json",
+                "tokenizer.json",
+                "config.json",
+            ],
+        )
+        .await;
+        let cache_dir = tempfile::TempDir::new().unwrap();
+
+        // Act
+        let combined = download_from_storage(&op, "org/model", cache_dir.path())
+            .await
+            .unwrap()
+            .expect("model should be found");
+
+        // Assert -- the files and bytes the single-file lookup fetches on
+        // its own, and nothing from the encoder-decoder export.
+        assert_eq!(
+            file_names(&combined),
+            vec!["config.json", "model.onnx", "tokenizer.json"]
+        );
+        let reference_cache = tempfile::TempDir::new().unwrap();
+        let reference = storage::download_model(&op, "org/model", reference_cache.path())
+            .await
+            .unwrap()
+            .expect("model should be found");
+        assert_eq!(file_names(&combined), file_names(&reference));
+        for name in file_names(&reference) {
+            assert_eq!(
+                std::fs::read(combined.join(&name)).unwrap(),
+                std::fs::read(reference.join(&name)).unwrap(),
+                "content of {name} should match the single-file lookup"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_lookup_finds_encoder_decoder_export_only_after_single_file_miss() {
+        // Arrange -- no model.onnx anywhere.
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        write_model_files(
+            &op,
+            "org/model",
+            &[
+                "encoder_model.onnx",
+                "decoder_model.onnx",
+                "tokenizer.json",
+                "config.json",
+            ],
+        )
+        .await;
+        let cache_dir = tempfile::TempDir::new().unwrap();
+
+        // Act
+        let single_file = storage::download_model(&op, "org/model", cache_dir.path())
+            .await
+            .unwrap();
+        let combined = download_from_storage(&op, "org/model", cache_dir.path())
+            .await
+            .unwrap();
+
+        // Assert
+        assert!(single_file.is_none(), "single-file lookup should miss");
+        let model_dir = combined.expect("encoder-decoder export should be found");
+        assert_eq!(
+            file_names(&model_dir),
+            vec![
+                "config.json",
+                "decoder_model.onnx",
+                "encoder_model.onnx",
+                "tokenizer.json"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_lookup_misses_when_neither_layout_exists() {
+        // Arrange
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        write_model_files(&op, "org/model", &["tokenizer.json", "config.json"]).await;
+        let cache_dir = tempfile::TempDir::new().unwrap();
+
+        // Act
+        let result = download_from_storage(&op, "org/model", cache_dir.path()).await;
+
+        // Assert
+        assert!(matches!(result, Ok(None)));
     }
 }

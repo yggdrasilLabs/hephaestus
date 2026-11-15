@@ -23,6 +23,7 @@ pub use error::CoreError;
 pub use pipeline::{
     AsrPipeline, ClassifierOutput, ClassifierPipeline, EmbeddingsPipeline, Entity,
     InferenceInput, Pipeline, PipelineKind, PipelineOutput, PreparedAudio,
-    PreparedData, PreparedInput, Seq2SeqPipeline, TokenClassifierPipeline,
+    PreparedData, PreparedInput, Seq2SeqOptions, Seq2SeqPipeline, TokenClassifierPipeline,
+    SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS,
 };
 pub use profile::{ModelProfile, detect_profile};

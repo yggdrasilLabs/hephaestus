@@ -5,9 +5,12 @@
 
 use std::collections::HashMap;
 use std::path::{Component, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
-use hephaestus_core::ExecutionProvider;
+use hephaestus_core::{
+    ExecutionProvider, SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS, Seq2SeqOptions,
+};
 use serde::Deserialize;
 
 /// Accepted `STORAGE_TYPE` values (T-06-05 allowlist).
@@ -17,6 +20,10 @@ use serde::Deserialize;
 /// `storage_operator_builds_for_every_allowed_storage_type` enforces this,
 /// so adding a backend here without its feature fails CI.
 const ALLOWED_STORAGE_TYPES: &[&str] = &["s3", "fs", "gcs", "none"];
+
+/// Largest accepted `SEQ2SEQ_MAX_INPUT_TOKENS`. The model's own position
+/// limit, checked when the pipeline loads, is usually far lower.
+const SEQ2SEQ_MAX_INPUT_TOKENS_LIMIT: u32 = 16_384;
 
 /// Runtime configuration deserialized from environment variables.
 ///
@@ -425,6 +432,78 @@ impl Config {
             options.insert("root".to_string(), format!("/{prefix}"));
         }
         Ok(options)
+    }
+}
+
+/// Seq2seq-only settings deserialized from environment variables.
+///
+/// Kept apart from [`Config`] and loaded only when the detected profile is
+/// seq2seq, so no other profile reads or depends on these variables. Both
+/// are optional and, left unset, change nothing.
+///
+/// - `SEQ2SEQ_MAX_INPUT_TOKENS` -- input token cap. Unset: 512, the cap
+///   every text profile uses.
+/// - `SEQ2SEQ_MAX_NEW_TOKENS` -- generated-token limit per input for
+///   encoder-decoder models. Unset: taken from the model's
+///   `generation_config.json` / `config.json`.
+#[derive(Deserialize, Debug, Default, PartialEq, Eq)]
+pub struct Seq2SeqConfig {
+    /// Input token cap, special tokens included (env `SEQ2SEQ_MAX_INPUT_TOKENS`).
+    #[serde(default)]
+    pub seq2seq_max_input_tokens: Option<u32>,
+
+    /// Generated-token limit per input (env `SEQ2SEQ_MAX_NEW_TOKENS`).
+    #[serde(default)]
+    pub seq2seq_max_new_tokens: Option<u32>,
+}
+
+impl Seq2SeqConfig {
+    /// Load seq2seq settings from environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a variable is set to something other than a
+    /// non-negative integer.
+    pub fn from_env() -> Result<Self, anyhow::Error> {
+        envy::from_env::<Self>().context("failed to load seq2seq config from environment")
+    }
+
+    /// Validate the settings before the pipeline is constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a set value is outside its accepted range.
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if let Some(tokens) = self.seq2seq_max_input_tokens {
+            let min = SEQ2SEQ_MIN_INPUT_TOKENS;
+            let max = SEQ2SEQ_MAX_INPUT_TOKENS_LIMIT;
+            if (tokens as usize) < min || tokens > max {
+                bail!("SEQ2SEQ_MAX_INPUT_TOKENS must be between {min} and {max} (got {tokens})");
+            }
+        }
+        if let Some(tokens) = self.seq2seq_max_new_tokens {
+            let max = SEQ2SEQ_MAX_NEW_TOKENS_LIMIT;
+            if tokens < 1 || tokens as usize > max {
+                bail!("SEQ2SEQ_MAX_NEW_TOKENS must be between 1 and {max} (got {tokens})");
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the pipeline options for these settings.
+    ///
+    /// `request_timeout` bounds one generation, so a decode loop cannot
+    /// outlive the request that asked for it. Unset values stay unset in
+    /// the options and keep their defaults.
+    pub fn options(&self, request_timeout: Duration) -> Seq2SeqOptions {
+        let mut options = Seq2SeqOptions::new().with_timeout(request_timeout);
+        if let Some(tokens) = self.seq2seq_max_input_tokens {
+            options = options.with_max_input_tokens(tokens as usize);
+        }
+        if let Some(tokens) = self.seq2seq_max_new_tokens {
+            options = options.with_max_new_tokens(tokens as usize);
+        }
+        options
     }
 }
 
@@ -954,5 +1033,114 @@ mod tests {
         let result = config.validate();
 
         assert!(result.is_err(), "overlap_secs >= window_size_secs should be rejected");
+    }
+
+    // --- Seq2seq config tests ---
+
+    #[test]
+    fn seq2seq_config_unset_leaves_every_option_at_its_default() {
+        // Arrange -- no SEQ2SEQ_* variable set.
+        let config = Seq2SeqConfig::default();
+        let timeout = Duration::from_secs(30);
+
+        // Act
+        let options = config.options(timeout);
+
+        // Assert -- only the request timeout is passed on; the input cap
+        // (512) and the token limit (from the model) keep their defaults.
+        assert_eq!(options, Seq2SeqOptions::new().with_timeout(timeout));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn seq2seq_config_deserializes_unset_variables_as_none() {
+        // Arrange -- an environment without any SEQ2SEQ_* variable.
+        let env = vec![("MODEL_ID".to_string(), "test-model".to_string())];
+
+        // Act
+        let config: Seq2SeqConfig =
+            envy::from_iter(env).expect("unset variables should deserialize");
+
+        // Assert
+        assert_eq!(config, Seq2SeqConfig::default());
+        assert_eq!(config.seq2seq_max_input_tokens, None);
+        assert_eq!(config.seq2seq_max_new_tokens, None);
+    }
+
+    #[test]
+    fn seq2seq_config_reads_both_variables() {
+        // Arrange
+        let env = vec![
+            ("SEQ2SEQ_MAX_INPUT_TOKENS".to_string(), "1024".to_string()),
+            ("SEQ2SEQ_MAX_NEW_TOKENS".to_string(), "200".to_string()),
+        ];
+        let timeout = Duration::from_secs(30);
+
+        // Act
+        let config: Seq2SeqConfig = envy::from_iter(env).expect("should deserialize");
+
+        // Assert
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.options(timeout),
+            Seq2SeqOptions::new()
+                .with_timeout(timeout)
+                .with_max_input_tokens(1024)
+                .with_max_new_tokens(200)
+        );
+    }
+
+    #[test]
+    fn seq2seq_config_rejects_non_numeric_value() {
+        // Arrange
+        let env = vec![("SEQ2SEQ_MAX_NEW_TOKENS".to_string(), "many".to_string())];
+
+        // Act
+        let result = envy::from_iter::<_, Seq2SeqConfig>(env);
+
+        // Assert
+        assert!(result.is_err(), "non-numeric value should be rejected");
+    }
+
+    #[test]
+    fn seq2seq_config_rejects_out_of_range_input_tokens() {
+        for tokens in [0, 7, SEQ2SEQ_MAX_INPUT_TOKENS_LIMIT + 1] {
+            // Arrange
+            let config = Seq2SeqConfig {
+                seq2seq_max_input_tokens: Some(tokens),
+                seq2seq_max_new_tokens: None,
+            };
+
+            // Act
+            let result = config.validate();
+
+            // Assert
+            let msg = format!("{}", result.expect_err("out-of-range value should fail"));
+            assert!(
+                msg.contains("SEQ2SEQ_MAX_INPUT_TOKENS"),
+                "error should name the variable: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn seq2seq_config_rejects_out_of_range_new_tokens() {
+        for tokens in [0, 4097] {
+            // Arrange
+            let config = Seq2SeqConfig {
+                seq2seq_max_input_tokens: None,
+                seq2seq_max_new_tokens: Some(tokens),
+            };
+
+            // Act
+            let result = config.validate();
+
+            // Assert
+            let msg = format!("{}", result.expect_err("out-of-range value should fail"));
+            assert!(
+                msg.contains("SEQ2SEQ_MAX_NEW_TOKENS"),
+                "error should name the variable: {msg}"
+            );
+        }
     }
 }

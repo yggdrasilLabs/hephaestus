@@ -3,13 +3,15 @@
 mod asr;
 mod classifier;
 mod embeddings;
+mod encoder_decoder;
 mod seq2seq;
 mod token_classifier;
 
 pub use asr::AsrPipeline;
 pub use classifier::ClassifierPipeline;
 pub use embeddings::EmbeddingsPipeline;
-pub use seq2seq::Seq2SeqPipeline;
+pub use encoder_decoder::{SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS};
+pub use seq2seq::{Seq2SeqOptions, Seq2SeqPipeline};
 pub use token_classifier::TokenClassifierPipeline;
 
 use std::path::{Path, PathBuf};
@@ -126,7 +128,7 @@ pub enum PipelineOutput {
     Classifier { label: String, score: f32 },
     /// Embedding vector (L2-normalized, unit length).
     Embeddings(Vec<f32>),
-    /// Generated text from a fused seq2seq model.
+    /// Generated text from a seq2seq model (fused or encoder-decoder).
     Seq2Seq(String),
     /// Token-level entity spans from NER/POS models.
     TokenClassifier(Vec<Entity>),
@@ -445,7 +447,7 @@ pub enum PipelineKind {
     Classifier(ClassifierPipeline),
     /// Sentence/document embeddings pipeline.
     Embeddings(EmbeddingsPipeline),
-    /// Fused single-pass seq2seq pipeline (D-10).
+    /// Seq2seq pipeline: fused single-pass or encoder-decoder (D-10).
     Seq2Seq(Seq2SeqPipeline),
     /// Token classification pipeline (NER, POS).
     TokenClassifier(TokenClassifierPipeline),
@@ -504,6 +506,16 @@ impl PipelineKind {
     ) -> Vec<Result<PipelineOutput, CoreError>> {
         if batch.is_empty() {
             return Vec::new();
+        }
+
+        // Encoder-decoder seq2seq generates token by token, so its inputs
+        // cannot share the single padded forward pass built below; that
+        // mode works through the batch itself. Every other pipeline,
+        // fused seq2seq included, continues unchanged.
+        if let Self::Seq2Seq(p) = self
+            && p.is_encoder_decoder()
+        {
+            return p.execute_batch_sequential(batch);
         }
 
         // Extract PreparedInput from each PreparedData::Text item.

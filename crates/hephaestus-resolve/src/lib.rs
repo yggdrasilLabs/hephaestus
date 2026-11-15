@@ -5,6 +5,7 @@
 //! [`ModelResolver::resolve()`] -- all download, caching, and retry
 //! details are hidden behind this single method (RSLV-05).
 
+pub(crate) mod encoder_decoder;
 pub mod error;
 pub mod forge;
 pub(crate) mod hf;

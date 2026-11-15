@@ -29,6 +29,10 @@ pub enum CoreError {
     #[error("config error: {0}")]
     Config(String),
 
+    /// Inference ran past its time budget and was abandoned.
+    #[error("inference timed out: {0}")]
+    Timeout(String),
+
     /// I/O error reading model files.
     #[error("i/o error")]
     Io(#[from] std::io::Error),

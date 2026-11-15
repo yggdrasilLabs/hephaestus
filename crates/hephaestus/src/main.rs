@@ -149,9 +149,18 @@ async fn main() -> Result<(), anyhow::Error> {
             PipelineKind::Embeddings(pipeline)
         }
         ModelProfile::Seq2Seq => {
-            let pipeline = Seq2SeqPipeline::new(&model_dir, &ep)
+            // Seq2seq-only settings are read here, so no other profile
+            // depends on them. Unset, they reproduce `Seq2SeqPipeline::new`.
+            let seq2seq_config = config::Seq2SeqConfig::from_env()?;
+            seq2seq_config.validate()?;
+            let options = seq2seq_config.options(Duration::from_secs(config.request_timeout_secs));
+            let pipeline = Seq2SeqPipeline::with_options(&model_dir, &ep, &options)
                 .context("failed to construct seq2seq pipeline")?;
-            tracing::info!("seq2seq pipeline constructed");
+            tracing::info!(
+                seq2seq_max_input_tokens = ?seq2seq_config.seq2seq_max_input_tokens,
+                seq2seq_max_new_tokens = ?seq2seq_config.seq2seq_max_new_tokens,
+                "seq2seq pipeline constructed"
+            );
             PipelineKind::Seq2Seq(pipeline)
         }
         ModelProfile::TokenClassifier => {

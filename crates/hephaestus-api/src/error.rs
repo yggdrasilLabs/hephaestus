@@ -52,6 +52,7 @@ impl From<CoreError> for ApiError {
             CoreError::InvalidInput(msg) => Self::BadRequest(msg),
             CoreError::ModelLoad(msg) | CoreError::ModelValidation(msg) => Self::Model(msg),
             CoreError::Config(msg) => Self::Internal(msg),
+            CoreError::Timeout(_) => Self::Timeout,
             CoreError::Io(e) => Self::Internal(e.to_string()),
             CoreError::JsonParse(e) => Self::Internal(e.to_string()),
         }
