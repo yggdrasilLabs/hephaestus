@@ -2,7 +2,8 @@
 //!
 //! This crate defines the [`Pipeline`] trait contract and profile
 //! implementations ([`ClassifierPipeline`], [`EmbeddingsPipeline`],
-//! [`Seq2SeqPipeline`], [`TokenClassifierPipeline`]).
+//! [`Seq2SeqPipeline`], [`TokenClassifierPipeline`],
+//! [`TextGenerationPipeline`]).
 //! Callers interact only through `prepare()` and `execute()` -- all
 //! internal tokenization, tensor construction, and ONNX inference
 //! details are hidden behind the trait boundary.
@@ -25,5 +26,9 @@ pub use pipeline::{
     InferenceInput, Pipeline, PipelineKind, PipelineOutput, PreparedAudio,
     PreparedData, PreparedInput, Seq2SeqOptions, Seq2SeqPipeline, TokenClassifierPipeline,
     SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS,
+};
+pub use pipeline::{
+    TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT, TEXT_GENERATION_MIN_INPUT_TOKENS, TextGenerationInput,
+    TextGenerationOptions, TextGenerationPipeline,
 };
 pub use profile::{ModelProfile, detect_profile};

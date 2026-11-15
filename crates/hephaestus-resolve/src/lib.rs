@@ -12,6 +12,7 @@ pub mod forge;
 pub(crate) mod hf;
 pub mod resolver;
 pub(crate) mod storage;
+pub(crate) mod text_generation;
 
 pub use error::ResolveError;
 pub use forge::{ConversionMetadata, ForgeClient, ForgeResponse, HttpForgeClient, StubForgeClient};

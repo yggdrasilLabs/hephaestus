@@ -725,4 +725,34 @@ mod tests {
         }
         assert!(!target.join("stale.txt").exists());
     }
+
+    /// Check the scanner against a real export, which is too large to keep
+    /// as a fixture. Set `HEPHAESTUS_EXTERNAL_DATA_GRAPH` to a graph file
+    /// and `HEPHAESTUS_EXTERNAL_DATA_EXPECTED` to the comma-separated data
+    /// file names the `onnx` library reports for it. Only the graph file
+    /// is read; the data files need not exist.
+    ///
+    /// `cargo test -p hephaestus-resolve --lib real_graph_reports -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires a real graph file (see doc comment)"]
+    fn real_graph_reports_the_expected_data_files() {
+        // Arrange
+        let graph = std::env::var("HEPHAESTUS_EXTERNAL_DATA_GRAPH")
+            .expect("HEPHAESTUS_EXTERNAL_DATA_GRAPH must be set");
+        let mut expected: Vec<String> = std::env::var("HEPHAESTUS_EXTERNAL_DATA_EXPECTED")
+            .expect("HEPHAESTUS_EXTERNAL_DATA_EXPECTED must be set")
+            .split(',')
+            .filter(|name| !name.is_empty())
+            .map(String::from)
+            .collect();
+        expected.sort();
+
+        // Act
+        let mut locations = locations_of_file(Path::new(&graph)).expect("scan graph");
+        locations.sort();
+
+        // Assert
+        println!("{graph}: {locations:?}");
+        assert_eq!(locations, expected);
+    }
 }

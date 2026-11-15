@@ -149,12 +149,12 @@ impl EncoderDecoderFiles {
 /// A plain copy of what the ONNX session reports, so the name rules below
 /// can be tested without loading a model.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TensorSpec {
-    name: String,
+pub(super) struct TensorSpec {
+    pub(super) name: String,
     /// `None` when the value is not a tensor (a sequence or a map).
-    element_type: Option<TensorElementType>,
+    pub(super) element_type: Option<TensorElementType>,
     /// Declared dimensions; `-1` marks a dynamic dimension.
-    dims: Vec<i64>,
+    pub(super) dims: Vec<i64>,
 }
 
 impl TensorSpec {
@@ -170,13 +170,13 @@ impl TensorSpec {
         }
     }
 
-    fn from_outlets(outlets: &[Outlet]) -> Vec<Self> {
+    pub(super) fn from_outlets(outlets: &[Outlet]) -> Vec<Self> {
         outlets.iter().map(Self::from_outlet).collect()
     }
 }
 
 /// List the names of a set of graph inputs or outputs for an error message.
-fn spec_names(specs: &[TensorSpec]) -> Vec<&str> {
+pub(super) fn spec_names(specs: &[TensorSpec]) -> Vec<&str> {
     specs.iter().map(|spec| spec.name.as_str()).collect()
 }
 
@@ -568,7 +568,7 @@ impl GenerationSettings {
 }
 
 /// Parse a token ID from a configuration value and bounds-check it.
-fn parse_token_id(
+pub(super) fn parse_token_id(
     key: &str,
     value: &serde_json::Value,
     vocab_size: Option<i64>,
@@ -589,7 +589,7 @@ fn parse_token_id(
 }
 
 /// Read and parse a JSON file from the model directory.
-fn read_json(path: &Path) -> Result<serde_json::Value, CoreError> {
+pub(super) fn read_json(path: &Path) -> Result<serde_json::Value, CoreError> {
     let text = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&text)?)
 }
@@ -691,7 +691,7 @@ where
 /// (the Hugging Face `no_repeat_ngram_size` rule; the start token and
 /// forced tokens count as part of the sequence). Nothing is collected
 /// when `ngram_size` is 0 or the sequence is still too short.
-fn extend_with_repeating_tokens(banned: &mut Vec<i64>, tokens: &[i64], ngram_size: usize) {
+pub(super) fn extend_with_repeating_tokens(banned: &mut Vec<i64>, tokens: &[i64], ngram_size: usize) {
     if ngram_size == 0 || tokens.len() + 1 < ngram_size {
         return;
     }
@@ -724,7 +724,7 @@ fn ensure_before(deadline: Option<Instant>, generated: usize) -> Result<(), Core
 ///
 /// Returns [`CoreError::Inference`] if the slice is empty or holds only
 /// NaN values.
-fn argmax_excluding(logits: &[f32], banned: &[i64]) -> Result<usize, CoreError> {
+pub(super) fn argmax_excluding(logits: &[f32], banned: &[i64]) -> Result<usize, CoreError> {
     let mut best: Option<(usize, f32)> = None;
     for (index, &value) in logits.iter().enumerate() {
         if value.is_nan() {
@@ -1157,7 +1157,7 @@ fn take_cache_tensor(
 }
 
 /// Borrow a token slice as a `(1, len)` int64 tensor.
-fn int64_tensor(len: usize, data: &[i64]) -> Result<TensorRef<'_, i64>, CoreError> {
+pub(super) fn int64_tensor(len: usize, data: &[i64]) -> Result<TensorRef<'_, i64>, CoreError> {
     TensorRef::from_array_view(([1, len], data)).map_err(|e| CoreError::Inference(e.to_string()))
 }
 

@@ -1,0 +1,5 @@
+{
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "chat_template": "{% for message in messages %}{% if message['role'] == 'system' %}a {{ message['content'] }} b {% else %}c {{ message['content'] }} d {% endif %}{% endfor %}{% if add_generation_prompt %}e{% endif %}"
+}

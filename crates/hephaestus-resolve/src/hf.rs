@@ -15,6 +15,7 @@ use crate::encoder_decoder::{
 };
 use crate::error::ResolveError;
 use crate::external_data;
+use crate::text_generation::{TEXT_GENERATION_FILES, is_text_generation_config};
 
 /// Split a combined model ID into `(owner, name)` components.
 ///
@@ -35,11 +36,19 @@ pub(crate) fn split_model_id(model_id: &str) -> (String, String) {
 /// Tries `onnx/model.onnx` first, falls back to `model.onnx`. If neither
 /// exists, returns [`ResolveError::NoOnnxExport`] per D-04. Also downloads
 /// `tokenizer.json` and `config.json`, and the external data files the
-/// graph refers to, if any (see [`fetch_external_data`]).
+/// graph refers to, if any (see [`fetch_external_data`]). For a text
+/// generation model (see [`is_text_generation_config`]) the chat template
+/// and generation settings are fetched too.
 ///
 /// Returns the snapshot root directory containing all model files.
+///
+/// `graph_file` is `model.onnx` unless the operator named another graph.
+/// Repositories that publish several precision variants keep them side by
+/// side (`onnx/model.onnx`, `onnx/model_q4.onnx`, ...), each with its own
+/// external data; only `graph_file` and the data it names are fetched.
 pub(crate) async fn download_from_hf(
     model_id: &str,
+    graph_file: &str,
 ) -> Result<PathBuf, ResolveError> {
     let client = HFClient::new()
         .map_err(|e| ResolveError::HuggingFace(format!("failed to create HFClient: {e}")))?;
@@ -48,12 +57,13 @@ pub(crate) async fn download_from_hf(
     let repo = client.model(&owner, &name);
 
     // Try onnx/model.onnx first, then model.onnx (D-04, Pitfall 4).
-    let (onnx_file, onnx_path) = match repo.download_file().filename("onnx/model.onnx").send().await {
-        Ok(path) => ("onnx/model.onnx", path),
+    let subdir_file = format!("{ONNX_SUBDIR_PREFIX}{graph_file}");
+    let (onnx_file, onnx_path) = match repo.download_file().filename(subdir_file.as_str()).send().await {
+        Ok(path) => (subdir_file.as_str(), path),
         Err(HFError::EntryNotFound { .. }) => {
             // Try flat layout.
-            match repo.download_file().filename("model.onnx").send().await {
-                Ok(path) => ("model.onnx", path),
+            match repo.download_file().filename(graph_file).send().await {
+                Ok(path) => (graph_file, path),
                 Err(HFError::EntryNotFound { .. }) => {
                     return Err(ResolveError::NoOnnxExport {
                         model_id: model_id.to_string(),
@@ -91,7 +101,7 @@ pub(crate) async fn download_from_hf(
             ResolveError::HuggingFace(format!("failed to download tokenizer.json: {e}"))
         })?;
 
-    let _config = repo
+    let config = repo
         .download_file()
         .filename("config.json")
         .send()
@@ -99,6 +109,19 @@ pub(crate) async fn download_from_hf(
         .map_err(|e| {
             ResolveError::HuggingFace(format!("failed to download config.json: {e}"))
         })?;
+
+    // Text generation only: chat template and generation settings. Which
+    // of them the model cannot do without is the pipeline's call.
+    if is_text_generation_config(&tokio::fs::read(&config).await?) {
+        for filename in TEXT_GENERATION_FILES {
+            match repo.download_file().filename(filename).send().await {
+                Ok(_) | Err(HFError::EntryNotFound { .. }) => {}
+                Err(e) => {
+                    tracing::warn!(model_id, filename, error = %e, "failed to download optional text generation file");
+                }
+            }
+        }
+    }
 
     // Optional: vocab.json (required by CTC ASR models like wav2vec2).
     match repo.download_file().filename("vocab.json").send().await {

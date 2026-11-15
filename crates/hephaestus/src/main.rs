@@ -15,7 +15,8 @@ use hephaestus_api::{AppState, Batcher, batcher_loop, build_router};
 use hephaestus_api::grpc::GrpcInferenceService;
 use hephaestus_core::{
     AsrPipeline, ClassifierPipeline, EmbeddingsPipeline, ExecutionProvider, ModelProfile,
-    PipelineKind, Seq2SeqPipeline, TokenClassifierPipeline, detect_profile,
+    PipelineKind, Seq2SeqPipeline, TextGenerationPipeline, TokenClassifierPipeline,
+    detect_profile,
 };
 use hephaestus_resolve::{HttpForgeClient, ModelResolver};
 use scylla_client::{ClientConfig, ScyllaClient, ServiceName};
@@ -27,6 +28,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let config = config::Config::from_env()?;
     config.validate()?;
     let ep: ExecutionProvider = config.parsed_execution_provider()?;
+    let graph_config = config::GraphConfig::from_env()?;
+    graph_config.validate()?;
 
     // 2. Initialize telemetry: structured JSON logging + conditional OTel export (D-11).
     //    Must be called inside the tokio runtime (after #[tokio::main]) because the
@@ -90,23 +93,29 @@ async fn main() -> Result<(), anyhow::Error> {
         if let Some(ref forge_url) = config.forge_url {
             let forge_client = HttpForgeClient::new(forge_url, config.forge_timeout_secs)
                 .context("failed to create Forge HTTP client")?;
-            let resolver = ModelResolver::new_with_client(
+            let mut resolver = ModelResolver::new_with_client(
                 operator.clone(),
                 forge_client,
             )
             .await
             .context("failed to construct model resolver")?;
+            if let Some(graph_file) = graph_config.graph_file() {
+                resolver = resolver.with_graph_file(graph_file);
+            }
 
             resolver
                 .resolve(&config.model_id)
                 .await
                 .context("failed to resolve model")?
         } else {
-            let resolver = ModelResolver::new_with_stub(
+            let mut resolver = ModelResolver::new_with_stub(
                 operator.clone(),
             )
             .await
             .context("failed to construct model resolver")?;
+            if let Some(graph_file) = graph_config.graph_file() {
+                resolver = resolver.with_graph_file(graph_file);
+            }
 
             resolver
                 .resolve(&config.model_id)
@@ -133,6 +142,16 @@ async fn main() -> Result<(), anyhow::Error> {
         profile = ?profile,
         "model profile detected"
     );
+
+    // Only the text generation pipeline can load a graph other than
+    // model.onnx; refuse the setting elsewhere instead of ignoring it.
+    if let Some(graph_file) = graph_config.graph_file()
+        && profile != ModelProfile::TextGeneration
+    {
+        anyhow::bail!(
+            "MODEL_ONNX_FILE={graph_file} is only supported for text generation models (detected profile: {profile:?})"
+        );
+    }
 
     // 4. Construct the appropriate pipeline based on detected profile (D-03).
     let pipeline_kind = match profile {
@@ -168,6 +187,26 @@ async fn main() -> Result<(), anyhow::Error> {
                 .context("failed to construct token classifier pipeline")?;
             tracing::info!("token classifier pipeline constructed");
             PipelineKind::TokenClassifier(pipeline)
+        }
+        ModelProfile::TextGeneration => {
+            // Read here, like the seq2seq settings, so no other profile
+            // depends on them.
+            let text_generation_config = config::TextGenerationConfig::from_env()?;
+            text_generation_config.validate()?;
+            let options = text_generation_config.options(
+                Duration::from_secs(config.request_timeout_secs),
+                graph_config.graph_file(),
+            );
+            let pipeline = TextGenerationPipeline::with_options(&model_dir, &ep, &options)
+                .context("failed to construct text generation pipeline")?;
+            tracing::info!(
+                text_generation_max_input_tokens = ?text_generation_config.text_generation_max_input_tokens,
+                text_generation_max_new_tokens = ?text_generation_config.text_generation_max_new_tokens,
+                text_generation_system_prompt_set = text_generation_config.text_generation_system_prompt.is_some(),
+                model_onnx_file = ?graph_config.graph_file(),
+                "text generation pipeline constructed"
+            );
+            PipelineKind::TextGeneration(pipeline)
         }
         ModelProfile::Asr => {
             let pipeline = AsrPipeline::new(&model_dir, &ep, &config.feature_extractor)
@@ -243,6 +282,23 @@ async fn main() -> Result<(), anyhow::Error> {
             model_id = %config.model_id,
             "skipping warmup for ASR profile (no audio warmup implemented)"
         );
+    } else if profile == ModelProfile::TextGeneration {
+        // A full generation can take as long as a request; reading a short
+        // prompt and generating one token warms the same code.
+        let mut pipeline = state.write_pipeline().await;
+        if let PipelineKind::TextGeneration(text_generation) = &mut *pipeline {
+            match text_generation.warm_up() {
+                Ok(()) => tracing::info!(
+                    model_id = %config.model_id,
+                    "warmup inference complete"
+                ),
+                Err(e) => tracing::warn!(
+                    model_id = %config.model_id,
+                    error = %e,
+                    "warmup inference failed, continuing without warmup"
+                ),
+            }
+        }
     } else {
         let warmup_text = config
             .warmup_input

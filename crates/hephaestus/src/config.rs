@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use hephaestus_core::{
     ExecutionProvider, SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS, Seq2SeqOptions,
+    TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT, TEXT_GENERATION_MIN_INPUT_TOKENS, TextGenerationOptions,
 };
 use serde::Deserialize;
 
@@ -127,7 +128,8 @@ pub struct Config {
 
     /// Optional model profile override (env `MODEL_PROFILE`, D-02).
     /// When set, takes precedence over auto-detection from config.json.
-    /// Accepted values: `classifier`, `embeddings`, `seq2seq`, `token_classifier`.
+    /// Accepted values: `classifier`, `embeddings`, `seq2seq`, `token_classifier`,
+    /// `asr`, `text_generation`.
     #[serde(default)]
     pub model_profile: Option<String>,
 
@@ -502,6 +504,159 @@ impl Seq2SeqConfig {
         }
         if let Some(tokens) = self.seq2seq_max_new_tokens {
             options = options.with_max_new_tokens(tokens as usize);
+        }
+        options
+    }
+}
+
+/// Which graph file of the model to load, from the environment.
+///
+/// Kept apart from [`Config`] like the per-profile settings. Unset, every
+/// model resolves and loads exactly as before.
+///
+/// - `MODEL_ONNX_FILE` -- file name of the graph to serve instead of
+///   `model.onnx`, for repositories that publish several precision
+///   variants side by side (`model_fp16.onnx`, `model_q4.onnx`, ...). Only
+///   that graph and its external data are fetched. Supported for text
+///   generation models.
+#[derive(Deserialize, Debug, Default, PartialEq, Eq)]
+pub struct GraphConfig {
+    /// Graph file name (env `MODEL_ONNX_FILE`).
+    #[serde(default)]
+    pub model_onnx_file: Option<String>,
+}
+
+impl GraphConfig {
+    /// Load the graph selection from environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the environment cannot be read.
+    pub fn from_env() -> Result<Self, anyhow::Error> {
+        envy::from_env::<Self>().context("failed to load graph config from environment")
+    }
+
+    /// Validate the graph file name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the name is a plain `*.onnx` file name
+    /// made of letters, digits, `.`, `_` and `-`: it becomes part of
+    /// storage and repository paths.
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        let Some(name) = self.model_onnx_file.as_deref() else {
+            return Ok(());
+        };
+        let plain = name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !plain || !name.ends_with(".onnx") || name.starts_with('.') || name.contains("..") {
+            bail!(
+                "MODEL_ONNX_FILE must be a file name ending in .onnx, such as model_q4.onnx (got '{name}')"
+            );
+        }
+        Ok(())
+    }
+
+    /// The graph file to serve, when it is not the default `model.onnx`.
+    pub fn graph_file(&self) -> Option<&str> {
+        self.model_onnx_file
+            .as_deref()
+            .filter(|name| *name != "model.onnx")
+    }
+}
+
+/// Largest accepted `TEXT_GENERATION_MAX_INPUT_TOKENS`. The model's own
+/// context is checked when the pipeline is constructed.
+const TEXT_GENERATION_MAX_INPUT_TOKENS_LIMIT: u32 = 32_768;
+
+/// Text-generation-only settings deserialized from environment variables.
+///
+/// Kept apart from [`Config`] and loaded only when the detected profile is
+/// text generation, so no other profile reads or depends on these
+/// variables. All are optional.
+///
+/// - `TEXT_GENERATION_MAX_INPUT_TOKENS` -- cap on prompt tokens (template,
+///   system message and user message together). Unset: 4096, or less when
+///   the model's context is smaller.
+/// - `TEXT_GENERATION_MAX_NEW_TOKENS` -- generated-token limit per
+///   request. Unset: `max_new_tokens` of the model's
+///   `generation_config.json`, else 256.
+/// - `TEXT_GENERATION_SYSTEM_PROMPT` -- system message for requests that
+///   bring none. Unset or empty: no system message is sent, and the
+///   model's chat template decides whether to add its own.
+#[derive(Deserialize, Debug, Default, PartialEq, Eq)]
+pub struct TextGenerationConfig {
+    /// Prompt token cap (env `TEXT_GENERATION_MAX_INPUT_TOKENS`).
+    #[serde(default)]
+    pub text_generation_max_input_tokens: Option<u32>,
+
+    /// Generated-token limit per request (env `TEXT_GENERATION_MAX_NEW_TOKENS`).
+    #[serde(default)]
+    pub text_generation_max_new_tokens: Option<u32>,
+
+    /// Default system message (env `TEXT_GENERATION_SYSTEM_PROMPT`).
+    #[serde(default)]
+    pub text_generation_system_prompt: Option<String>,
+}
+
+impl TextGenerationConfig {
+    /// Load text generation settings from environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a numeric variable is set to something other
+    /// than a non-negative integer.
+    pub fn from_env() -> Result<Self, anyhow::Error> {
+        envy::from_env::<Self>().context("failed to load text generation config from environment")
+    }
+
+    /// Validate the settings before the pipeline is constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a set value is outside its accepted range.
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if let Some(tokens) = self.text_generation_max_input_tokens {
+            let min = TEXT_GENERATION_MIN_INPUT_TOKENS;
+            let max = TEXT_GENERATION_MAX_INPUT_TOKENS_LIMIT;
+            if (tokens as usize) < min || tokens > max {
+                bail!(
+                    "TEXT_GENERATION_MAX_INPUT_TOKENS must be between {min} and {max} (got {tokens})"
+                );
+            }
+        }
+        if let Some(tokens) = self.text_generation_max_new_tokens {
+            let max = TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT;
+            if tokens < 1 || tokens as usize > max {
+                bail!("TEXT_GENERATION_MAX_NEW_TOKENS must be between 1 and {max} (got {tokens})");
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the pipeline options for these settings.
+    ///
+    /// `request_timeout` bounds one generation, so a decode loop cannot
+    /// outlive the request that asked for it. Unset values stay unset in
+    /// the options and keep their defaults.
+    pub fn options(
+        &self,
+        request_timeout: Duration,
+        graph_file: Option<&str>,
+    ) -> TextGenerationOptions {
+        let mut options = TextGenerationOptions::new().with_timeout(request_timeout);
+        if let Some(graph_file) = graph_file {
+            options = options.with_graph_file(graph_file);
+        }
+        if let Some(tokens) = self.text_generation_max_input_tokens {
+            options = options.with_max_input_tokens(tokens as usize);
+        }
+        if let Some(tokens) = self.text_generation_max_new_tokens {
+            options = options.with_max_new_tokens(tokens as usize);
+        }
+        if let Some(prompt) = &self.text_generation_system_prompt {
+            options = options.with_system_prompt(prompt.as_str());
         }
         options
     }
@@ -1141,6 +1296,161 @@ mod tests {
                 msg.contains("SEQ2SEQ_MAX_NEW_TOKENS"),
                 "error should name the variable: {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn text_generation_config_unset_leaves_every_option_at_its_default() {
+        // Arrange -- no TEXT_GENERATION_* variable set.
+        let config = TextGenerationConfig::default();
+
+        // Act
+        let validation = config.validate();
+        let options = config.options(Duration::from_secs(30), None);
+
+        // Assert -- only the request timeout is carried over.
+        assert!(validation.is_ok());
+        assert_eq!(
+            options,
+            TextGenerationOptions::new().with_timeout(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn text_generation_config_reads_every_variable() {
+        // Arrange
+        let env = vec![
+            ("TEXT_GENERATION_MAX_INPUT_TOKENS".to_string(), "2048".to_string()),
+            ("TEXT_GENERATION_MAX_NEW_TOKENS".to_string(), "400".to_string()),
+            (
+                "TEXT_GENERATION_SYSTEM_PROMPT".to_string(),
+                "You summarize calls.\nBe brief.".to_string(),
+            ),
+            ("SEQ2SEQ_MAX_NEW_TOKENS".to_string(), "7".to_string()),
+        ];
+
+        // Act
+        let config: TextGenerationConfig = envy::from_iter(env).expect("should deserialize");
+
+        // Assert -- the seq2seq variable is not this profile's business.
+        assert_eq!(config.text_generation_max_input_tokens, Some(2048));
+        assert_eq!(config.text_generation_max_new_tokens, Some(400));
+        assert_eq!(
+            config.text_generation_system_prompt.as_deref(),
+            Some("You summarize calls.\nBe brief.")
+        );
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.options(Duration::from_secs(60), Some("model_q4.onnx")),
+            TextGenerationOptions::new()
+                .with_timeout(Duration::from_secs(60))
+                .with_graph_file("model_q4.onnx")
+                .with_max_input_tokens(2048)
+                .with_max_new_tokens(400)
+                .with_system_prompt("You summarize calls.\nBe brief.")
+        );
+    }
+
+    #[test]
+    fn text_generation_config_deserializes_unset_variables_as_none() {
+        // Arrange -- an environment with other profiles' variables only.
+        let env = vec![
+            ("MODEL_ID".to_string(), "test/model".to_string()),
+            ("SEQ2SEQ_MAX_INPUT_TOKENS".to_string(), "1024".to_string()),
+        ];
+
+        // Act
+        let config: TextGenerationConfig = envy::from_iter(env).expect("should deserialize");
+
+        // Assert
+        assert_eq!(config, TextGenerationConfig::default());
+    }
+
+    #[test]
+    fn text_generation_config_rejects_out_of_range_values() {
+        for tokens in [0, 15, TEXT_GENERATION_MAX_INPUT_TOKENS_LIMIT + 1] {
+            let config = TextGenerationConfig {
+                text_generation_max_input_tokens: Some(tokens),
+                ..TextGenerationConfig::default()
+            };
+            let msg = format!("{}", config.validate().expect_err("input cap should be rejected"));
+            assert!(msg.contains("TEXT_GENERATION_MAX_INPUT_TOKENS"), "{msg}");
+        }
+        for tokens in [0, TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT as u32 + 1] {
+            let config = TextGenerationConfig {
+                text_generation_max_new_tokens: Some(tokens),
+                ..TextGenerationConfig::default()
+            };
+            let msg = format!("{}", config.validate().expect_err("token limit should be rejected"));
+            assert!(msg.contains("TEXT_GENERATION_MAX_NEW_TOKENS"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn text_generation_config_rejects_non_numeric_value() {
+        // Arrange
+        let env = vec![("TEXT_GENERATION_MAX_NEW_TOKENS".to_string(), "many".to_string())];
+
+        // Act
+        let result = envy::from_iter::<_, TextGenerationConfig>(env);
+
+        // Assert
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn graph_config_unset_selects_nothing() {
+        // Arrange -- an environment without MODEL_ONNX_FILE.
+        let env = vec![("MODEL_ID".to_string(), "test/model".to_string())];
+
+        // Act
+        let config: GraphConfig = envy::from_iter(env).expect("should deserialize");
+
+        // Assert
+        assert_eq!(config, GraphConfig::default());
+        assert!(config.validate().is_ok());
+        assert_eq!(config.graph_file(), None);
+    }
+
+    #[test]
+    fn graph_config_reads_the_variant() {
+        // Arrange
+        let env = vec![("MODEL_ONNX_FILE".to_string(), "model_q4.onnx".to_string())];
+
+        // Act
+        let config: GraphConfig = envy::from_iter(env).expect("should deserialize");
+
+        // Assert
+        assert!(config.validate().is_ok());
+        assert_eq!(config.graph_file(), Some("model_q4.onnx"));
+    }
+
+    #[test]
+    fn graph_config_naming_the_default_changes_nothing() {
+        let config = GraphConfig {
+            model_onnx_file: Some("model.onnx".to_string()),
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.graph_file(), None);
+    }
+
+    #[test]
+    fn graph_config_rejects_paths_and_other_files() {
+        for name in [
+            "",
+            "model_q4",
+            "onnx/model_q4.onnx",
+            "../model.onnx",
+            "..onnx",
+            ".onnx",
+            "model q4.onnx",
+            "model.onnx_data",
+        ] {
+            let config = GraphConfig {
+                model_onnx_file: Some(name.to_string()),
+            };
+            let msg = format!("{}", config.validate().expect_err("name should be rejected"));
+            assert!(msg.contains("MODEL_ONNX_FILE"), "{name}: {msg}");
         }
     }
 }

@@ -18,6 +18,7 @@ use crate::encoder_decoder::{
 };
 use crate::error::ResolveError;
 use crate::external_data;
+use crate::text_generation::{TEXT_GENERATION_FILES, is_text_generation_config};
 
 /// Required model files for a complete model directory.
 pub(crate) const MODEL_ONNX: &str = "model.onnx";
@@ -70,23 +71,48 @@ pub(crate) async fn download_model(
     model_id: &str,
     cache_dir: &Path,
 ) -> Result<Option<PathBuf>, ResolveError> {
+    debug_assert_eq!(ONNX_SUBDIR_MODEL, format!("{ONNX_SUBDIR_PREFIX}{MODEL_ONNX}"));
+    download_model_graph(op, model_id, cache_dir, MODEL_ONNX).await
+}
+
+/// [`download_model`] for a graph file other than `model.onnx`.
+///
+/// A model may be stored with several precision variants side by side
+/// (`model.onnx`, `model_q4.onnx`, ...). Only `graph_file` and the
+/// external data it names are fetched; with `model.onnx` this is exactly
+/// [`download_model`]. A local copy that was downloaded for another
+/// variant does not hold the requested graph and is replaced.
+pub(crate) async fn download_model_graph(
+    op: &Operator,
+    model_id: &str,
+    cache_dir: &Path,
+    graph_file: &str,
+) -> Result<Option<PathBuf>, ResolveError> {
     let final_dir = cache_dir.join(STORAGE_CACHE_SUBDIR).join(model_id);
+    let subdir_file = format!("{ONNX_SUBDIR_PREFIX}{graph_file}");
 
     // Already cached locally -- skip download.
     if final_dir.exists() && !discard_incomplete_local_copy(model_id, &final_dir).await {
-        tracing::debug!(model_id, path = %final_dir.display(), "model already cached locally");
-        return Ok(Some(final_dir));
+        let holds_graph = graph_file == MODEL_ONNX
+            || final_dir.join(graph_file).exists()
+            || final_dir.join(&subdir_file).exists();
+        if holds_graph {
+            tracing::debug!(model_id, path = %final_dir.display(), "model already cached locally");
+            return Ok(Some(final_dir));
+        }
+        tracing::info!(model_id, graph_file, "local copy holds another graph; downloading again");
+        tokio::fs::remove_dir_all(&final_dir).await?;
     }
 
     // Try downloading the ONNX model file.
     // Check model.onnx first, then onnx/model.onnx.
     let mut onnx_filename = None;
     let mut onnx_bytes = None;
-    for candidate in &[MODEL_ONNX, ONNX_SUBDIR_MODEL] {
+    for candidate in [graph_file, subdir_file.as_str()] {
         let path = format_storage_path(model_id, candidate);
         match download_file(op, &path).await? {
             Some(bytes) => {
-                onnx_filename = Some(*candidate);
+                onnx_filename = Some(candidate);
                 onnx_bytes = Some(bytes);
                 break;
             }
@@ -129,6 +155,14 @@ pub(crate) async fn download_model(
     // Write supporting files.
     tokio::fs::write(temp_dir.path().join(TOKENIZER_JSON), &tokenizer_data).await?;
     tokio::fs::write(temp_dir.path().join(CONFIG_JSON), &config_data).await?;
+
+    // Text generation only: chat template and generation settings, each
+    // optional here. No other model has these requested.
+    if is_text_generation_config(&config_data) {
+        for filename in TEXT_GENERATION_FILES {
+            download_file_into(op, model_id, filename, temp_dir.path()).await?;
+        }
+    }
 
     // Weights kept outside the graph file. A stored graph whose data is
     // not in storage cannot be loaded, so it counts as a miss and the
@@ -1098,6 +1132,251 @@ mod tests {
             .expect("single-file model should be found");
 
         // Assert -- exactly the three files it has always fetched.
+        assert_eq!(
+            list_files(&model_dir),
+            vec!["config.json", "model.onnx", "tokenizer.json"]
+        );
+    }
+
+    // --- Graph variants ---
+
+    /// A repository with two precision variants, as onnx-community
+    /// publishes them: each graph with its own, numbered, data files.
+    async fn write_variants(op: &Operator) {
+        use crate::external_data::test_support::{external_tensor, model};
+        let q4 = model(&[
+            external_tensor("a", "model_q4.onnx_data"),
+            external_tensor("b", "model_q4.onnx_data_1"),
+        ]);
+        let full = model(&[
+            external_tensor("a", "model.onnx_data"),
+            external_tensor("b", "model.onnx_data_1"),
+            external_tensor("c", "model.onnx_data_2"),
+        ]);
+        op.write("org/llm/onnx/model_q4.onnx", q4).await.unwrap();
+        op.write("org/llm/onnx/model.onnx", full).await.unwrap();
+        op.write(
+            "org/llm/config.json",
+            br#"{"architectures": ["Qwen3ForCausalLM"]}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+        for name in [
+            "onnx/model_q4.onnx_data",
+            "onnx/model_q4.onnx_data_1",
+            "onnx/model.onnx_data",
+            "onnx/model.onnx_data_1",
+            "onnx/model.onnx_data_2",
+            "onnx/model_fp16.onnx",
+            "tokenizer.json",
+            "chat_template.jinja",
+        ] {
+            op.write(&format!("org/llm/{name}"), name.as_bytes().to_vec())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn named_graph_is_fetched_with_its_own_data_only() {
+        // Arrange
+        let op = memory_operator();
+        write_variants(&op).await;
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let model_dir = download_model_graph(&op, "org/llm", cache_dir.path(), "model_q4.onnx")
+            .await
+            .unwrap()
+            .expect("variant should be found");
+
+        // Assert -- nothing of the other variants.
+        assert_eq!(
+            list_files(&model_dir),
+            vec![
+                "chat_template.jinja",
+                "config.json",
+                "onnx/model_q4.onnx",
+                "onnx/model_q4.onnx_data",
+                "onnx/model_q4.onnx_data_1",
+                "tokenizer.json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn default_graph_is_still_model_onnx_among_variants() {
+        // Arrange
+        let op = memory_operator();
+        write_variants(&op).await;
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let model_dir = download_model(&op, "org/llm", cache_dir.path())
+            .await
+            .unwrap()
+            .expect("model should be found");
+
+        // Assert
+        assert_eq!(
+            list_files(&model_dir),
+            vec![
+                "chat_template.jinja",
+                "config.json",
+                "onnx/model.onnx",
+                "onnx/model.onnx_data",
+                "onnx/model.onnx_data_1",
+                "onnx/model.onnx_data_2",
+                "tokenizer.json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_copy_of_another_variant_is_replaced() {
+        // Arrange -- the default graph is cached locally, q4 is asked for.
+        let op = memory_operator();
+        write_variants(&op).await;
+        let cache_dir = TempDir::new().unwrap();
+        download_model(&op, "org/llm", cache_dir.path()).await.unwrap();
+
+        // Act
+        let model_dir = download_model_graph(&op, "org/llm", cache_dir.path(), "model_q4.onnx")
+            .await
+            .unwrap()
+            .expect("variant should be found");
+
+        // Assert
+        assert!(model_dir.join("onnx/model_q4.onnx").exists());
+        assert!(model_dir.join("onnx/model_q4.onnx_data_1").exists());
+        assert!(!model_dir.join("onnx/model.onnx").exists());
+    }
+
+    #[tokio::test]
+    async fn missing_named_graph_is_a_cache_miss() {
+        // Arrange
+        let op = memory_operator();
+        write_variants(&op).await;
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let result = download_model_graph(&op, "org/llm", cache_dir.path(), "model_int8.onnx").await;
+
+        // Assert
+        assert!(matches!(result, Ok(None)));
+    }
+
+    // --- Text generation models ---
+
+    #[tokio::test]
+    async fn single_file_download_fetches_text_generation_files() {
+        // Arrange -- a decoder-only export as Forge stores it.
+        let op = memory_operator();
+        op.write(
+            "org/llm/config.json",
+            br#"{"architectures": ["LlamaForCausalLM"]}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+        for name in [
+            "model.onnx",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "generation_config.json",
+            "chat_template.jinja",
+            "vocab.json",
+        ] {
+            op.write(&format!("org/llm/{name}"), name.as_bytes().to_vec())
+                .await
+                .unwrap();
+        }
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let model_dir = download_model(&op, "org/llm", cache_dir.path())
+            .await
+            .unwrap()
+            .expect("model should be found");
+
+        // Assert -- the three extra files, and nothing else that is stored.
+        assert_eq!(
+            list_files(&model_dir),
+            vec![
+                "chat_template.jinja",
+                "config.json",
+                "generation_config.json",
+                "model.onnx",
+                "tokenizer.json",
+                "tokenizer_config.json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn text_generation_download_tolerates_missing_optional_files() {
+        // Arrange -- template inside tokenizer_config.json, nothing else.
+        let op = memory_operator();
+        op.write(
+            "org/llm/config.json",
+            br#"{"architectures": ["Qwen2ForCausalLM"]}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+        for name in ["onnx/model.onnx", "tokenizer.json", "tokenizer_config.json"] {
+            op.write(&format!("org/llm/{name}"), name.as_bytes().to_vec())
+                .await
+                .unwrap();
+        }
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let model_dir = download_model(&op, "org/llm", cache_dir.path())
+            .await
+            .unwrap()
+            .expect("model should be found");
+
+        // Assert
+        assert_eq!(
+            list_files(&model_dir),
+            vec![
+                "config.json",
+                "onnx/model.onnx",
+                "tokenizer.json",
+                "tokenizer_config.json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn other_models_do_not_get_text_generation_files() {
+        // Arrange -- a classifier stored next to files of the same names.
+        let op = memory_operator();
+        op.write(
+            "org/model/config.json",
+            br#"{"architectures": ["DistilBertForSequenceClassification"]}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+        for name in [
+            "model.onnx",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "generation_config.json",
+            "chat_template.jinja",
+        ] {
+            op.write(&format!("org/model/{name}"), name.as_bytes().to_vec())
+                .await
+                .unwrap();
+        }
+        let cache_dir = TempDir::new().unwrap();
+
+        // Act
+        let model_dir = download_model(&op, "org/model", cache_dir.path())
+            .await
+            .unwrap()
+            .expect("model should be found");
+
+        // Assert -- exactly the files this lookup has always fetched.
         assert_eq!(
             list_files(&model_dir),
             vec!["config.json", "model.onnx", "tokenizer.json"]

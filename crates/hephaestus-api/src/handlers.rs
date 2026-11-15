@@ -12,6 +12,8 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 
+use hephaestus_core::{InferenceInput, PipelineKind};
+
 use crate::error::ApiError;
 use crate::metrics::StageTimer;
 use crate::state::AppState;
@@ -21,6 +23,41 @@ use crate::state::AppState;
 pub struct InferRequest {
     /// The text to run inference on.
     pub text: String,
+    /// System message for this request. Read by text generation models
+    /// only; every other profile ignores it, whatever its JSON type, as it
+    /// ignores any field it does not know.
+    #[serde(default)]
+    pub system: Option<serde_json::Value>,
+}
+
+/// Turn a request into the input its pipeline takes.
+///
+/// For a pipeline without a system message this is the text alone, so the
+/// `system` field changes nothing there. For text generation the field
+/// must be a string (or absent / `null`, which selects the server's
+/// default system prompt).
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] if a text generation request carries
+/// a `system` value that is not a string.
+fn request_input(
+    pipeline: &PipelineKind,
+    text: String,
+    system: Option<serde_json::Value>,
+) -> Result<InferenceInput, ApiError> {
+    if !pipeline.accepts_system_prompt() {
+        return Ok(InferenceInput::Text(text));
+    }
+    match system {
+        None | Some(serde_json::Value::Null) => Ok(InferenceInput::Text(text)),
+        Some(serde_json::Value::String(system)) => {
+            Ok(InferenceInput::TextWithSystem { text, system })
+        }
+        Some(_) => Err(ApiError::BadRequest(
+            "system field must be a string".to_string(),
+        )),
+    }
 }
 
 /// POST /infer -- run inference on the loaded model.
@@ -31,6 +68,7 @@ pub struct InferRequest {
 /// The response shape depends on the loaded model profile:
 /// - Classifier: `{"label": "...", "score": ..., "model_id": "...", "latency_ms": ...}`
 /// - Embeddings: `{"embedding": [...], "model_id": "...", "latency_ms": ...}`
+/// - Seq2seq and text generation: `{"generated_text": "...", "model_id": "...", "latency_ms": ...}`
 ///
 /// # Errors
 ///
@@ -68,7 +106,8 @@ pub async fn infer(
             // per rules/anti-lock-across-await.md.
             let prepared = {
                 let pipeline = state.read_pipeline().await;
-                timer.time("tokenization", || pipeline.prepare(req.text))?
+                let input = request_input(&pipeline, req.text, req.system)?;
+                timer.time("tokenization", || pipeline.prepare(input))?
             }; // Read lock dropped here before submit.
 
             let pipeline_output = state
@@ -84,7 +123,8 @@ pub async fn infer(
             // while only inference holds exclusive access (SC-02).
             let prepared = {
                 let pipeline = state.read_pipeline().await;
-                timer.time("tokenization", || pipeline.prepare(req.text))?
+                let input = request_input(&pipeline, req.text, req.system)?;
+                timer.time("tokenization", || pipeline.prepare(input))?
             }; // Read lock dropped here.
             let pipeline_output = {
                 let mut pipeline = state.write_pipeline().await;
@@ -255,5 +295,26 @@ mod tests {
         assert!(output["embedding"].is_array());
         assert_eq!(output["model_id"], "all-MiniLM-L6-v2");
         assert_eq!(output["latency_ms"], 5);
+    }
+
+    #[test]
+    fn infer_request_accepts_any_system_value() {
+        // A request that carried a `system` field of any JSON type was
+        // accepted before the field had a meaning; it still is.
+        for (json, expected) in [
+            (r#"{"text": "hi"}"#, None),
+            (r#"{"text": "hi", "system": null}"#, None),
+            (r#"{"text": "hi", "system": "Be brief."}"#, Some(serde_json::json!("Be brief."))),
+            (r#"{"text": "hi", "system": 5}"#, Some(serde_json::json!(5))),
+            (r#"{"text": "hi", "system": {"a": [1]}}"#, Some(serde_json::json!({"a": [1]}))),
+            (r#"{"text": "hi", "other": true, "system": ""}"#, Some(serde_json::json!(""))),
+        ] {
+            // Act
+            let req: InferRequest = serde_json::from_str(json).expect("should deserialize");
+
+            // Assert
+            assert_eq!(req.text, "hi", "{json}");
+            assert_eq!(req.system, expected, "{json}");
+        }
     }
 }

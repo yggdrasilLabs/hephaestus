@@ -135,6 +135,52 @@ def _validate_graph(model_path: str) -> None:
         ) from exc
 
 
+def _decoder_only_dummy_inputs(
+    session: ort.InferenceSession,
+) -> dict[str, np.ndarray] | None:
+    """Dummy inputs for a decoder-only (text generation) ``model.onnx``.
+
+    ``main_export`` writes a causal language model as a single
+    ``model.onnx`` with ``past_key_values.*`` inputs.  Its inputs must
+    agree with each other: the attention mask covers the cached tokens
+    plus the new ones, and positions index into that sequence.  Feeding
+    every dynamic dimension as 1 and every value as 1 breaks that (one
+    cached token, one new token, a mask of one, position 1), so the
+    graph is fed the first step of a generation instead: an empty cache,
+    one token, a mask of one, position 0.  That is also the first call
+    Hephaestus makes.
+
+    Returns ``None`` for any graph without ``past_key_values.*`` inputs,
+    and for a merged decoder (``use_cache_branch``); those are fed as
+    they always were.
+    """
+    inputs = session.get_inputs()
+    names = [inp.name for inp in inputs]
+    if "use_cache_branch" in names or not any(
+        name.startswith("past_key_values.") for name in names
+    ):
+        return None
+
+    feeds: dict[str, np.ndarray] = {}
+    for inp in inputs:
+        shape = [
+            1 if d is None or isinstance(d, str) else d
+            for d in inp.shape
+        ]
+        if inp.name.startswith("past_key_values."):
+            # (batch, heads, sequence, head_dim): nothing cached yet.
+            if len(shape) == 4:
+                shape[2] = 0
+            feeds[inp.name] = np.zeros(shape, dtype=np.float32)
+        elif inp.name == "position_ids":
+            feeds[inp.name] = np.zeros(shape, dtype=np.int64)
+        elif inp.type == "tensor(int64)":
+            feeds[inp.name] = np.ones(shape, dtype=np.int64)
+        else:
+            feeds[inp.name] = np.ones(shape, dtype=np.float32)
+    return feeds
+
+
 def validate_model(output_dir: str) -> None:
     """Two-stage ONNX model validation.
 
@@ -146,6 +192,10 @@ def validate_model(output_dir: str) -> None:
 
     Also verifies that ``tokenizer.json`` and ``config.json`` exist
     and are parseable (D-07).
+
+    A decoder-only (text generation) ``model.onnx`` is fed the first
+    step of a generation in stage 2 (see
+    :func:`_decoder_only_dummy_inputs`).
 
     A seq2seq export has no ``model.onnx``.  When neither ``model.onnx``
     location exists, an encoder-decoder export (see
@@ -184,16 +234,18 @@ def validate_model(output_dir: str) -> None:
     # --- Stage 2: Dummy inference ---
     try:
         session = ort.InferenceSession(model_path)
-        dummy_inputs: dict[str, np.ndarray] = {}
-        for inp in session.get_inputs():
-            shape = [
-                1 if d is None or isinstance(d, str) else d
-                for d in inp.shape
-            ]
-            if inp.type == "tensor(int64)":
-                dummy_inputs[inp.name] = np.ones(shape, dtype=np.int64)
-            else:
-                dummy_inputs[inp.name] = np.ones(shape, dtype=np.float32)
+        dummy_inputs = _decoder_only_dummy_inputs(session)
+        if dummy_inputs is None:
+            dummy_inputs = {}
+            for inp in session.get_inputs():
+                shape = [
+                    1 if d is None or isinstance(d, str) else d
+                    for d in inp.shape
+                ]
+                if inp.type == "tensor(int64)":
+                    dummy_inputs[inp.name] = np.ones(shape, dtype=np.int64)
+                else:
+                    dummy_inputs[inp.name] = np.ones(shape, dtype=np.float32)
         session.run(None, dummy_inputs)
     except Exception as exc:
         raise ConversionError(

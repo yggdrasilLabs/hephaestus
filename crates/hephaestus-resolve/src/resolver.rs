@@ -27,6 +27,8 @@ pub struct ModelResolver<F: ForgeClient = StubForgeClient> {
     cache_dir: PathBuf,
     operator: Option<opendal::Operator>,
     forge: F,
+    /// Graph file to resolve; `model.onnx` unless set otherwise.
+    graph_file: String,
 }
 
 /// Directory under the Hugging Face home that holds, as regular files, the
@@ -113,7 +115,28 @@ impl<F: ForgeClient> ModelResolver<F> {
             cache_dir,
             operator,
             forge,
+            graph_file: storage::MODEL_ONNX.to_string(),
         })
+    }
+
+    /// Resolve `graph_file` instead of `model.onnx`.
+    ///
+    /// For repositories that publish several precision variants of one
+    /// model side by side (`model.onnx`, `model_fp16.onnx`,
+    /// `model_q4.onnx`, ...): only the named graph and the external data
+    /// it refers to are fetched. A named graph is a single-file model, so
+    /// neither the encoder-decoder lookup nor Forge conversion (which
+    /// produces `model.onnx`) is tried for it. Passing `model.onnx`
+    /// changes nothing.
+    #[must_use]
+    pub fn with_graph_file(mut self, graph_file: impl Into<String>) -> Self {
+        self.graph_file = graph_file.into();
+        self
+    }
+
+    /// Whether a graph other than `model.onnx` was asked for.
+    fn names_graph(&self) -> bool {
+        self.graph_file != storage::MODEL_ONNX
     }
 
     /// Resolve a model ID to a local directory containing ONNX files.
@@ -135,7 +158,11 @@ impl<F: ForgeClient> ModelResolver<F> {
 
         // Tier 1: Storage cache (D-05). RetryLayer on the Operator handles retries.
         if let Some(op) = &self.operator {
-            let storage_result = download_from_storage(op, model_id, &self.cache_dir).await;
+            let storage_result = if self.names_graph() {
+                storage::download_model_graph(op, model_id, &self.cache_dir, &self.graph_file).await
+            } else {
+                download_from_storage(op, model_id, &self.cache_dir).await
+            };
 
             match storage_result {
                 Ok(Some(path)) => {
@@ -153,9 +180,11 @@ impl<F: ForgeClient> ModelResolver<F> {
 
         // Tier 2: HuggingFace with retry (D-05).
         let model_id_owned = model_id.to_string();
+        let graph_file = self.graph_file.clone();
         let hf_result = with_retry(3, Duration::from_millis(500), move || {
             let id = model_id_owned.clone();
-            async move { hf::download_from_hf(&id).await }
+            let graph_file = graph_file.clone();
+            async move { hf::download_from_hf(&id, &graph_file).await }
         })
         .await;
 
@@ -173,6 +202,12 @@ impl<F: ForgeClient> ModelResolver<F> {
                 self.spawn_cache_back(model_id, &model_dir);
 
                 return Ok(model_dir);
+            }
+            Err(ResolveError::NoOnnxExport { .. }) if self.names_graph() => {
+                return Err(ResolveError::HuggingFace(format!(
+                    "graph file '{}' of model '{model_id}' is not in the repository (404)",
+                    self.graph_file,
+                )));
             }
             Err(ResolveError::NoOnnxExport { .. }) => {
                 // No single-file model: look for an encoder-decoder export

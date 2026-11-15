@@ -22,6 +22,8 @@ pub enum ModelProfile {
     TokenClassifier,
     /// Automatic speech recognition (e.g., wav2vec2, Whisper).
     Asr,
+    /// Text generation with a decoder-only instruction model (causal LM).
+    TextGeneration,
 }
 
 /// Detect the model profile from config.json fields.
@@ -30,6 +32,9 @@ pub enum ModelProfile {
 /// 1. Explicit `override_profile` string (from `MODEL_PROFILE` env var)
 /// 2. `architectures` array suffix matching
 /// 3. `pipeline_tag` field fallback
+/// 4. Decoder-only causal language models (`...ForCausalLM`), checked last
+///    so that every configuration the earlier steps recognise keeps the
+///    profile it always had
 ///
 /// # Errors
 ///
@@ -86,8 +91,15 @@ pub fn detect_profile(
             "feature-extraction" | "sentence-similarity" => {
                 return Ok(ModelProfile::Embeddings);
             }
+            "text-generation" => return Ok(ModelProfile::TextGeneration),
             _ => {}
         }
+    }
+
+    // Decoder-only causal LMs. Reached only by configurations that no rule
+    // above recognises, which until now ended in the error below.
+    if is_causal_lm(config) {
+        return Ok(ModelProfile::TextGeneration);
     }
 
     Err(CoreError::Config(
@@ -96,10 +108,25 @@ pub fn detect_profile(
     ))
 }
 
+/// Whether `architectures` names a decoder-only causal language model
+/// (`LlamaForCausalLM`, `Qwen2ForCausalLM`, ...).
+fn is_causal_lm(config: &serde_json::Value) -> bool {
+    config
+        .get("architectures")
+        .and_then(|v| v.as_array())
+        .is_some_and(|archs| {
+            archs
+                .iter()
+                .filter_map(|arch| arch.as_str())
+                .any(|name| name.ends_with("ForCausalLM"))
+        })
+}
+
 /// Parse a profile string into a [`ModelProfile`].
 ///
 /// Accepts case-insensitive values: `classifier`, `embeddings`,
-/// `seq2seq`, `token_classifier` (with optional hyphen variant).
+/// `seq2seq`, `token_classifier`, `text_generation` (with optional hyphen
+/// variant), `asr`.
 fn parse_profile_string(s: &str) -> Result<ModelProfile, CoreError> {
     match s.to_lowercase().as_str() {
         "classifier" => Ok(ModelProfile::Classifier),
@@ -107,8 +134,9 @@ fn parse_profile_string(s: &str) -> Result<ModelProfile, CoreError> {
         "seq2seq" => Ok(ModelProfile::Seq2Seq),
         "token_classifier" | "token-classifier" => Ok(ModelProfile::TokenClassifier),
         "asr" => Ok(ModelProfile::Asr),
+        "text_generation" | "text-generation" => Ok(ModelProfile::TextGeneration),
         _ => Err(CoreError::Config(format!(
-            "unrecognized model profile '{s}'; expected one of: classifier, embeddings, seq2seq, token_classifier, asr"
+            "unrecognized model profile '{s}'; expected one of: classifier, embeddings, seq2seq, token_classifier, asr, text_generation"
         ))),
     }
 }
@@ -377,5 +405,79 @@ mod tests {
 
         // Assert
         assert_eq!(profile, ModelProfile::Asr);
+    }
+
+    #[test]
+    fn test_detect_text_generation_from_causal_lm_architecture() {
+        for arch in ["LlamaForCausalLM", "Qwen2ForCausalLM", "Phi3ForCausalLM", "MistralForCausalLM"] {
+            // Arrange
+            let config = serde_json::json!({ "architectures": [arch] });
+
+            // Act
+            let profile = detect_profile(&config, None).expect("should detect profile");
+
+            // Assert
+            assert_eq!(profile, ModelProfile::TextGeneration, "{arch}");
+        }
+    }
+
+    #[test]
+    fn test_detect_text_generation_from_pipeline_tag() {
+        // Arrange
+        let config = serde_json::json!({ "pipeline_tag": "text-generation" });
+
+        // Act
+        let profile = detect_profile(&config, None).expect("should detect profile");
+
+        // Assert
+        assert_eq!(profile, ModelProfile::TextGeneration);
+    }
+
+    #[test]
+    fn test_override_text_generation() {
+        // Arrange -- an architecture the suffix rules read as embeddings.
+        let config = serde_json::json!({ "architectures": ["GPT2LMHeadModel"] });
+
+        // Act / Assert -- both spellings, any case.
+        for name in ["text_generation", "text-generation", "TEXT_GENERATION"] {
+            let profile = detect_profile(&config, Some(name)).expect("should detect profile");
+            assert_eq!(profile, ModelProfile::TextGeneration, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_causal_lm_rule_does_not_change_earlier_outcomes() {
+        // Every configuration an earlier rule recognises keeps its
+        // profile, also when a causal LM architecture is listed with it.
+        let cases = [
+            (serde_json::json!({ "architectures": ["WhisperForConditionalGeneration"] }), ModelProfile::Asr),
+            (serde_json::json!({ "architectures": ["Wav2Vec2ForCTC"] }), ModelProfile::Asr),
+            (serde_json::json!({ "architectures": ["T5ForConditionalGeneration"] }), ModelProfile::Seq2Seq),
+            (serde_json::json!({ "architectures": ["BartForConditionalGeneration"] }), ModelProfile::Seq2Seq),
+            (serde_json::json!({ "architectures": ["BertForSequenceClassification"] }), ModelProfile::Classifier),
+            (serde_json::json!({ "architectures": ["BertForTokenClassification"] }), ModelProfile::TokenClassifier),
+            (serde_json::json!({ "architectures": ["BertModel"] }), ModelProfile::Embeddings),
+            (serde_json::json!({ "architectures": ["GPT2LMHeadModel"] }), ModelProfile::Embeddings),
+            (
+                serde_json::json!({ "architectures": ["XForCausalLM", "BertModel"] }),
+                ModelProfile::Embeddings,
+            ),
+            (
+                serde_json::json!({ "architectures": ["XForCausalLM"], "pipeline_tag": "summarization" }),
+                ModelProfile::Seq2Seq,
+            ),
+            (
+                serde_json::json!({ "architectures": ["XForCausalLM"], "pipeline_tag": "feature-extraction" }),
+                ModelProfile::Embeddings,
+            ),
+        ];
+
+        for (config, expected) in cases {
+            // Act
+            let profile = detect_profile(&config, None).expect("should detect profile");
+
+            // Assert
+            assert_eq!(profile, expected, "{config}");
+        }
     }
 }

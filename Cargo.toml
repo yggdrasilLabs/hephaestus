@@ -10,6 +10,10 @@ ndarray = "0.17"
 # Tokenization
 tokenizers = "0.23"
 
+# Chat templates (Jinja) of text-generation models
+minijinja = { version = "3.1", features = ["json", "loop_controls", "serde"] }
+minijinja-contrib = { version = "3.1", features = ["pycompat"] }
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
