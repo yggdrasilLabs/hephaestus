@@ -10,7 +10,7 @@
 //! the `/metrics` scrape endpoint.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -61,14 +61,19 @@ impl StageTimer {
     pub fn time<T>(&self, stage: &'static str, f: impl FnOnce() -> T) -> T {
         let start = Instant::now();
         let result = f();
-        let elapsed = start.elapsed().as_secs_f64();
+        self.record(stage, start.elapsed());
+        result
+    }
+
+    /// Record the duration of a stage that was timed elsewhere: a
+    /// generation that shared its forward passes with others.
+    pub fn record(&self, stage: &'static str, elapsed: Duration) {
         metrics::histogram!(
             "hephaestus_stage_duration_seconds",
             "stage" => stage,
             "model_id" => self.model_id.clone(),
         )
-        .record(elapsed);
-        result
+        .record(elapsed.as_secs_f64());
     }
 
     /// Record overall request completion metrics.

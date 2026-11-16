@@ -56,7 +56,9 @@ pub struct AppState {
     metrics_handle: PrometheusHandle,
 
     /// Optional dynamic batcher handle. `Some` when `BATCH_ENABLED=true`;
-    /// `None` when batching is disabled (default, zero overhead per D-07).
+    /// `None` when batching is disabled (default, zero overhead per D-07),
+    /// and when the pipeline batches its generations itself
+    /// (`TEXT_GENERATION_MAX_BATCH` above one).
     batcher: Option<Batcher>,
 
     /// Window duration in seconds for streaming audio chunking (D-10).
@@ -81,8 +83,22 @@ impl AppState {
         overlap_secs: f32,
     ) -> Self {
         let preparer = pipeline.preparer();
+        // A pipeline that batches its generations itself takes requests
+        // one by one, between token steps. The dynamic batcher would hand
+        // it closed batches and make every request wait for the batch
+        // before it, so it is not used.
+        let generation_batch = pipeline.generation_batch_width();
+        let batcher = batcher.filter(|_| {
+            if generation_batch > 1 {
+                tracing::warn!(
+                    generation_batch,
+                    "dynamic batching is not used: text generation batches its requests itself"
+                );
+            }
+            generation_batch <= 1
+        });
         let pipeline = Arc::new(RwLock::new(pipeline));
-        let worker = InferenceWorker::spawn(Arc::clone(&pipeline), &model_id);
+        let worker = InferenceWorker::spawn(Arc::clone(&pipeline), &model_id, generation_batch);
         Self {
             pipeline,
             preparer,
@@ -125,6 +141,12 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn waiting_requests(&self) -> usize {
         self.worker.waiting()
+    }
+
+    /// Generations running together right now.
+    #[cfg(test)]
+    pub(crate) fn active_generations(&self) -> usize {
+        self.worker.active_generations()
     }
 
     /// Check whether the service is ready to accept inference requests.

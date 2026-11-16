@@ -20,19 +20,36 @@
 //!
 //! The worker, not the handler, owns a job from the moment it is queued:
 //! the prepared input, the deadline, the cancel flag and the reply channel
-//! all travel in the [`Job`]. A later change that runs several generations
-//! in one loop can therefore take more jobs off the queue between token
-//! steps (a non-blocking variant of [`Shared::next_job`]), give each
-//! sequence the control built by [`Shared::control`], and answer each one
-//! as it finishes, without touching the handlers.
+//! all travel in the [`Job`].
+//!
+//! # Batched generation
+//!
+//! A text generation pipeline with a batch width above one
+//! (`TEXT_GENERATION_MAX_BATCH`) runs up to that many requests together
+//! ([`run_generation_batch`]). Between two token steps the worker takes
+//! waiting requests off the queue, without blocking, for as long as the
+//! batch has a free place and the next request's prompt fits it; their
+//! prompts are read in one forward pass of their own and they then decode
+//! with the others. A request leaves, and is answered, in the step it
+//! ends: end token, token limit, its deadline, or its caller going away.
+//! The others go on.
+//!
+//! Requests still start in arrival order. One whose prompt does not fit
+//! the running batch waits at the head of the queue, and holds back those
+//! behind it, until the batch has grown or emptied; that is what keeps a
+//! misfit from waiting forever. The queue capacity counts waiting
+//! requests only, as before: a request stops counting when it joins.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use hephaestus_core::{CoreError, Execution, GenerationControl, PipelineKind, PreparedData};
+use hephaestus_core::{
+    BatchProgress, CoreError, Execution, GenerationBatch, GenerationControl, GenerationRequest,
+    PipelineKind, PreparedData, TextGenerationPipeline,
+};
 use tokio::sync::{RwLock, oneshot};
 
 use crate::batcher::BatchRequest;
@@ -152,6 +169,14 @@ impl Request {
     /// should run, and `None` for one whose caller is gone or whose
     /// deadline has passed; the latter is answered with
     /// [`ApiError::Timeout`].
+    /// Whether nobody will read this request's result: its caller is gone
+    /// or its deadline has passed.
+    fn is_dead(&self, now: Instant) -> bool {
+        self.cancel.is_cancelled()
+            || self.reply.is_closed()
+            || self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
     fn start(self, now: Instant) -> Option<Started> {
         let Self {
             prepared,
@@ -214,6 +239,11 @@ struct Shared {
     queue: Mutex<Queue>,
     /// Signalled when a job is queued or the queue is closed.
     wake: Condvar,
+    /// Generations that may share a forward pass; 1 runs one job at a
+    /// time.
+    generation_batch: usize,
+    /// Generations in the running batch.
+    active_generations: AtomicUsize,
     /// Test seam: runs on the worker thread just before each job's model
     /// run. Lets a test stand in for a slow model.
     #[cfg(test)]
@@ -339,6 +369,54 @@ impl Shared {
         }
     }
 
+    /// Take the next job if one is queued. Never blocks; `None` also once
+    /// the queue is closed.
+    fn try_next_job(&self) -> Option<Job> {
+        let mut queue = self.lock_queue();
+        if queue.closed {
+            return None;
+        }
+        queue.jobs.pop_front()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.lock_queue().closed
+    }
+
+    /// Answer the requests of a job that will not run because the server
+    /// is shutting down.
+    fn refuse_for_shutdown(&self, job: Job) {
+        for request in job.requests {
+            self.count_dropped("shutdown");
+            let _ = request.reply.send(Err(ApiError::NotReady));
+        }
+    }
+
+    /// Record a forward pass of the generation batch: how many sequences
+    /// shared it. `pass` is `prompt` for a pass that read the prompts of
+    /// joining requests and `decode` for a token step.
+    fn record_batch_pass(&self, pass: &'static str, sequences: usize) {
+        if sequences == 0 {
+            return;
+        }
+        metrics::histogram!(
+            "hephaestus_generation_batch_sequences",
+            "model_id" => self.model_id.clone(),
+            "pass" => pass,
+        )
+        .record(sequences as f64);
+    }
+
+    /// Publish how many generations are running together.
+    fn set_active_generations(&self, active: usize) {
+        self.active_generations.store(active, Ordering::SeqCst);
+        metrics::gauge!(
+            "hephaestus_generation_active_sequences",
+            "model_id" => self.model_id.clone(),
+        )
+        .set(active as f64);
+    }
+
     /// The limits of one request's generation: its deadline and its
     /// cancel flag, asked before every token step.
     fn control(&self, deadline: Option<Instant>, cancel: CancelFlag) -> GenerationControl {
@@ -420,10 +498,7 @@ impl Shared {
         };
         self.wake.notify_all();
         for job in queued {
-            for request in job.requests {
-                self.count_dropped("shutdown");
-                let _ = request.reply.send(Err(ApiError::NotReady));
-            }
+            self.refuse_for_shutdown(job);
         }
     }
 }
@@ -515,7 +590,15 @@ impl InferenceWorker {
     /// # Panics
     ///
     /// Panics if the operating system cannot start a thread.
-    pub(crate) fn spawn(pipeline: Arc<RwLock<PipelineKind>>, model_id: &str) -> Self {
+    ///
+    /// `generation_batch` is how many generations may run together
+    /// ([`PipelineKind::generation_batch_width`]); 1 runs one job at a
+    /// time.
+    pub(crate) fn spawn(
+        pipeline: Arc<RwLock<PipelineKind>>,
+        model_id: &str,
+        generation_batch: usize,
+    ) -> Self {
         let shared = Arc::new(Shared {
             model_id: Arc::from(model_id),
             capacity: AtomicUsize::new(DEFAULT_QUEUE_CAPACITY),
@@ -526,6 +609,8 @@ impl InferenceWorker {
                 next_id: 0,
             }),
             wake: Condvar::new(),
+            generation_batch: generation_batch.max(1),
+            active_generations: AtomicUsize::new(0),
             #[cfg(test)]
             before_inference: Mutex::new(None),
             #[cfg(test)]
@@ -570,6 +655,12 @@ impl InferenceWorker {
     #[cfg(test)]
     pub(crate) fn waiting(&self) -> usize {
         self.shared.waiting.load(Ordering::SeqCst)
+    }
+
+    /// Generations running together right now.
+    #[cfg(test)]
+    pub(crate) fn active_generations(&self) -> usize {
+        self.shared.active_generations.load(Ordering::SeqCst)
     }
 
     /// Take a place in the queue for a request that must be answered by
@@ -633,14 +724,25 @@ fn worker_loop(shared: &Arc<Shared>, pipeline: &RwLock<PipelineKind>) {
     while let Some(job) = shared.next_job() {
         // A panic in the model run must not end the thread: the reply
         // channels of the lost job are dropped, which answers its callers.
-        if catch_unwind(AssertUnwindSafe(|| run_job(shared, pipeline, job))).is_err() {
+        let run = AssertUnwindSafe(|| {
+            if shared.generation_batch > 1 {
+                run_generation_batch(shared, pipeline, job);
+            } else {
+                // Uncontended: requests are prepared without the
+                // pipeline, and nothing else takes this lock once the
+                // server is up.
+                run_job(shared, &mut pipeline.blocking_write(), job);
+            }
+        });
+        if catch_unwind(run).is_err() {
+            shared.set_active_generations(0);
             tracing::error!("inference job panicked");
         }
     }
 }
 
 /// Run one job on the pipeline and answer its requests.
-fn run_job(shared: &Shared, pipeline: &RwLock<PipelineKind>, job: Job) {
+fn run_job(shared: &Shared, pipeline: &mut PipelineKind, job: Job) {
     let Job {
         requests,
         batched,
@@ -658,9 +760,6 @@ fn run_job(shared: &Shared, pipeline: &RwLock<PipelineKind>, job: Job) {
     }
 
     let _entered = span.enter();
-    // Uncontended: requests are prepared without the pipeline, and nothing
-    // else takes this lock once the server is up.
-    let mut pipeline = pipeline.blocking_write();
     shared.before_inference();
 
     if batched {
@@ -692,6 +791,152 @@ fn run_job(shared: &Shared, pipeline: &RwLock<PipelineKind>, job: Job) {
             };
             answer(shared, request.reply, result, run_started.elapsed());
         }
+    }
+}
+
+/// What the worker keeps of a request while it generates in the batch.
+struct Generating {
+    reply: Reply,
+    /// Records the `inference` stage: from joining the batch to leaving.
+    timer: Option<StageTimer>,
+    /// Span of the submitting task, entered to report the outcome.
+    span: tracing::Span,
+    /// Dropped with the entry, like [`Job::_done`].
+    _done: oneshot::Sender<()>,
+}
+
+/// The text generation pipeline inside `pipeline`, if that is what it is.
+fn text_generation(pipeline: &mut PipelineKind) -> Option<&mut TextGenerationPipeline> {
+    match pipeline {
+        PipelineKind::TextGeneration(generator) => Some(generator),
+        _ => None,
+    }
+}
+
+/// Run generations together, starting with `first`, until none is running
+/// and none is waiting; see the module documentation.
+///
+/// Holds the pipeline for all of that time. Nothing else takes it once the
+/// server is up.
+fn run_generation_batch(shared: &Shared, pipeline: &RwLock<PipelineKind>, first: Job) {
+    let mut pipeline = pipeline.blocking_write();
+    if text_generation(&mut pipeline).is_none() {
+        // Only text generation has a batch width above one.
+        return run_job(shared, &mut pipeline, first);
+    }
+    let mut batch = GenerationBatch::new();
+    let mut generating: HashMap<u64, Generating> = HashMap::new();
+    // The job at the head of the queue, taken off it and not started yet.
+    let mut head = Some(first);
+
+    loop {
+        // 1. Start the waiting requests that can join now, in order.
+        let mut joining = Vec::new();
+        let mut prompts = Vec::new();
+        loop {
+            if head.is_none() {
+                head = shared.try_next_job();
+            }
+            let Some(job) = head.take() else { break };
+            if shared.is_closed() {
+                shared.refuse_for_shutdown(job);
+                continue;
+            }
+            let now = Instant::now();
+            let single = match job.requests.as_slice() {
+                [request] if !job.batched => Some(request),
+                _ => None,
+            };
+            let Some(request) = single else {
+                // A whole batch from the dynamic batcher: it runs by
+                // itself, when nothing else is running.
+                if batch.is_empty() && joining.is_empty() {
+                    run_job(shared, &mut pipeline, job);
+                    continue;
+                }
+                head = Some(job);
+                break;
+            };
+            let prompt = request.prepared.token_count().unwrap_or(0);
+            let admitted = request.is_dead(now)
+                || text_generation(&mut pipeline)
+                    .is_none_or(|generator| generator.admits(&batch, &prompts, prompt));
+            if !admitted {
+                head = Some(job);
+                break;
+            }
+            let Job {
+                id,
+                mut requests,
+                timer,
+                span,
+                _done,
+                ..
+            } = job;
+            // A request nobody waits for is answered here and never runs.
+            let Some(started) = requests.pop().and_then(|request| request.start(now)) else {
+                continue;
+            };
+            prompts.push(prompt);
+            joining.push(GenerationRequest {
+                id,
+                prepared: started.prepared,
+                control: started.control,
+            });
+            generating.insert(
+                id,
+                Generating {
+                    reply: started.reply,
+                    timer,
+                    span,
+                    _done,
+                },
+            );
+        }
+
+        let Some(generator) = text_generation(&mut pipeline) else {
+            return;
+        };
+
+        // 2. Read the prompts of the requests that join.
+        if !joining.is_empty() {
+            shared.before_inference();
+            let progress = generator.join(&mut batch, joining);
+            shared.record_batch_pass("prompt", progress.rows);
+            answer_finished(shared, &mut generating, progress);
+        }
+        shared.set_active_generations(batch.len());
+        if batch.is_empty() {
+            if head.is_none() {
+                break;
+            }
+            // The request at the head joins the empty batch.
+            continue;
+        }
+
+        // 3. One token for every running generation.
+        let progress = generator.step(&mut batch);
+        shared.record_batch_pass("decode", progress.rows);
+        answer_finished(shared, &mut generating, progress);
+        shared.set_active_generations(batch.len());
+    }
+}
+
+/// Answer the requests that left the generation batch.
+fn answer_finished(
+    shared: &Shared,
+    generating: &mut HashMap<u64, Generating>,
+    progress: BatchProgress,
+) {
+    for done in progress.finished {
+        let Some(request) = generating.remove(&done.id) else {
+            continue;
+        };
+        let _entered = request.span.enter();
+        if let Some(timer) = &request.timer {
+            timer.record("inference", done.elapsed);
+        }
+        answer(shared, request.reply, done.result, done.elapsed);
     }
 }
 

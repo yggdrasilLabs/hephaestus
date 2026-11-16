@@ -1061,6 +1061,424 @@ mod tests {
         batcher_task.abort();
     }
 
+    /// A text generation pipeline over the batch fixture graph of
+    /// `hephaestus-core` (`model_batch.onnx`), in which a wrong mask,
+    /// padding or cache changes the reply. `width` generations may run
+    /// together. With `end_token` replies end by themselves after 1 to 27
+    /// tokens; without, every reply runs to `max_new_tokens`.
+    fn batch_generation_pipeline(
+        width: usize,
+        max_new_tokens: usize,
+        end_token: bool,
+    ) -> (PipelineKind, tempfile::TempDir) {
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../hephaestus-core/tests/fixtures");
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (from, file, to) in [
+            ("text_generation", "model_batch.onnx", "model.onnx"),
+            ("text_generation", "tokenizer_config.json", "tokenizer_config.json"),
+            ("seq2seq", "tokenizer.json", "tokenizer.json"),
+        ] {
+            std::fs::copy(fixtures.join(from).join(file), dir.path().join(to))
+                .expect("copy fixture");
+        }
+        let mut config = serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "bos_token_id": 0,
+            "max_position_embeddings": 512,
+            "vocab_size": 16
+        });
+        if end_token {
+            config["eos_token_id"] = 2.into();
+        }
+        std::fs::write(dir.path().join("config.json"), config.to_string()).expect("write config");
+        let options = TextGenerationOptions::new()
+            .with_max_new_tokens(max_new_tokens)
+            .with_max_batch(width);
+        let pipeline =
+            TextGenerationPipeline::with_options(dir.path(), &ExecutionProvider::Cpu, &options)
+                .expect("pipeline should load");
+        (PipelineKind::TextGeneration(pipeline), dir)
+    }
+
+    /// Requests whose prompts and replies differ in length.
+    const BATCH_TEXTS: [&str; 8] = [
+        "h i",
+        "a",
+        "l k j i h g",
+        "a b c d e f g h i j k l a b c",
+        "k",
+        "b b",
+        "e f g h i j k l",
+        "j k l a",
+    ];
+
+    /// State around [`batch_generation_pipeline`] whose every token step
+    /// takes `step_time` per running generation. Returns the state and the
+    /// largest number of generations seen running together.
+    fn batch_generation_state(
+        width: usize,
+        max_new_tokens: usize,
+        end_token: bool,
+        step_time: Duration,
+        batcher: Option<Batcher>,
+    ) -> (Arc<AppState>, Arc<AtomicUsize>, tempfile::TempDir) {
+        let (pipeline, dir) = batch_generation_pipeline(width, max_new_tokens, end_token);
+        let state = Arc::new(state_for(pipeline, Duration::from_secs(30), batcher));
+        let most = Arc::new(AtomicUsize::new(0));
+        let (hook_state, hook_most) = (Arc::downgrade(&state), Arc::clone(&most));
+        state.set_on_generation_step(move || {
+            if let Some(state) = hook_state.upgrade() {
+                hook_most.fetch_max(state.active_generations(), Ordering::SeqCst);
+            }
+            std::thread::sleep(step_time);
+        });
+        (state, most, dir)
+    }
+
+    /// The `/infer` response body for `text`, without its latency.
+    async fn infer_body(app: &axum::Router, text: &str) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(infer_request(text))
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::OK, "'{text}'");
+        let mut body = json_body(response).await;
+        body.as_object_mut().expect("object").remove("latency_ms");
+        body
+    }
+
+    /// What every text of `texts` is answered with when it is generated
+    /// alone, by a server without batching.
+    async fn solo_bodies(
+        max_new_tokens: usize,
+        end_token: bool,
+        texts: &[&str],
+    ) -> Vec<serde_json::Value> {
+        let (pipeline, _dir) = batch_generation_pipeline(1, max_new_tokens, end_token);
+        let state = Arc::new(state_for(pipeline, Duration::from_secs(30), None));
+        let app = crate::build_router(state);
+        let mut bodies = Vec::new();
+        for text in texts {
+            bodies.push(infer_body(&app, text).await);
+        }
+        bodies
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_generations_share_a_batch_and_get_their_solo_responses() {
+        // Arrange -- three places, sixteen requests at once.
+        let width = 3;
+        let texts: Vec<&str> = BATCH_TEXTS.iter().chain(&BATCH_TEXTS).copied().collect();
+        let expected = solo_bodies(40, true, &texts).await;
+        let (state, most, _dir) =
+            batch_generation_state(width, 40, true, Duration::from_millis(1), None);
+        let app = crate::build_router(Arc::clone(&state));
+
+        // Act
+        let requests: Vec<_> = texts
+            .iter()
+            .map(|text| {
+                let app = app.clone();
+                let text = (*text).to_string();
+                tokio::spawn(async move { infer_body(&app, &text).await })
+            })
+            .collect();
+
+        // Assert -- text and token counts are each request's own.
+        for ((request, text), expected) in requests.into_iter().zip(&texts).zip(&expected) {
+            let body = request.await.expect("task should join");
+            assert_eq!(&body, expected, "'{text}'");
+            assert!(body["prompt_tokens"].is_u64() && body["completion_tokens"].is_u64());
+        }
+        assert_eq!(
+            most.load(Ordering::SeqCst),
+            width,
+            "the batch should fill up and never hold more than its width"
+        );
+        until("the batch to empty", || state.active_generations() == 0).await;
+        assert_eq!(state.waiting_requests(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_joins_a_generation_that_is_already_running() {
+        // Arrange -- "b b" runs for 27 tokens; "a" arrives a few in.
+        let expected = solo_bodies(40, true, &["b b", "a"]).await;
+        let (state, most, _dir) =
+            batch_generation_state(2, 40, true, Duration::from_millis(5), None);
+        let app = crate::build_router(Arc::clone(&state));
+
+        // Act
+        let first = {
+            let app = app.clone();
+            tokio::spawn(async move { infer_body(&app, "b b").await })
+        };
+        until("the first generation to run", || {
+            state.active_generations() == 1
+        })
+        .await;
+        let second = infer_body(&app, "a").await;
+        let first_was_running = !first.is_finished();
+        let first = first.await.expect("task should join");
+
+        // Assert -- the second did not wait for the first to end, and
+        // neither changed the other.
+        assert!(first_was_running, "the second request was answered first");
+        assert_eq!(most.load(Ordering::SeqCst), 2, "both ran together");
+        assert_eq!(first, expected[0]);
+        assert_eq!(second, expected[1]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_generation_leaves_the_batch_to_a_waiting_request() {
+        // Arrange -- two places, replies of 60 tokens, three requests.
+        let expected = solo_bodies(60, false, &["b b", "h i"]).await;
+        let (state, most, _dir) =
+            batch_generation_state(2, 60, false, Duration::from_millis(3), None);
+        let run = |text: &str| {
+            let state = Arc::clone(&state);
+            let text = text.to_string();
+            tokio::spawn(async move {
+                let ticket = state.admit(None).expect("queue has room");
+                let prepared = state.prepare(text).expect("prepare should succeed");
+                ticket.run(prepared, None).await
+            })
+        };
+
+        // Act -- two run, the third waits for a place.
+        let stays = run("b b");
+        let leaves = run("a");
+        until("two generations to run", || state.active_generations() == 2).await;
+        let waits = run("h i");
+        until("the third request to wait", || state.waiting_requests() == 1).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let waited_for_a_place = state.waiting_requests() == 1 && !waits.is_finished();
+        // One caller goes away: its place goes to the waiting request.
+        leaves.abort();
+        until("the third request to start", || state.waiting_requests() == 0).await;
+        let stays_was_running = !stays.is_finished();
+        let stays = stays.await.expect("task should join").expect("generation");
+        let waits = waits.await.expect("task should join").expect("generation");
+
+        // Assert
+        assert!(waited_for_a_place, "a full batch takes no third request");
+        assert!(stays_was_running, "the place was freed before the batch ended");
+        assert_eq!(most.load(Ordering::SeqCst), 2);
+        for (execution, expected) in [(stays, &expected[0]), (waits, &expected[1])] {
+            let json = execution.to_json();
+            assert_eq!(json["generated_text"], expected["generated_text"]);
+            assert_eq!(json["prompt_tokens"], expected["prompt_tokens"]);
+            assert_eq!(json["completion_tokens"], 60);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generation_past_its_deadline_times_out_alone() {
+        // Arrange -- two generations of 60 slow tokens; one has 60 ms.
+        let expected = solo_bodies(60, false, &["b b"]).await;
+        let (state, _most, _dir) =
+            batch_generation_state(2, 60, false, Duration::from_millis(3), None);
+        let run = |text: &str, deadline: Option<Duration>| {
+            let state = Arc::clone(&state);
+            let text = text.to_string();
+            tokio::spawn(async move {
+                let ticket = state
+                    .admit(deadline.map(|after| Instant::now() + after))
+                    .expect("queue has room");
+                let prepared = state.prepare(text).expect("prepare should succeed");
+                ticket.run(prepared, None).await
+            })
+        };
+
+        // Act
+        let unlimited = run("b b", None);
+        let limited = run("a", Some(Duration::from_millis(60)));
+        until("two generations to run", || state.active_generations() == 2).await;
+        let limited = limited.await.expect("task should join");
+        let unlimited_was_running = !unlimited.is_finished();
+        let unlimited = unlimited.await.expect("task should join").expect("generation");
+
+        // Assert
+        assert!(matches!(limited, Err(ApiError::Timeout)), "{:?}", limited.err());
+        assert!(unlimited_was_running, "the timeout was answered at once");
+        let json = unlimited.to_json();
+        assert_eq!(json["generated_text"], expected[0]["generated_text"]);
+        assert_eq!(json["completion_tokens"], 60);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_queue_is_refused_while_a_batch_is_running() {
+        // Arrange -- two places in the batch, one in the queue; the model
+        // is held at its first token step.
+        let (hook, started, release) = gated_hook();
+        let (pipeline, _dir) = batch_generation_pipeline(2, 4, false);
+        let state =
+            state_for(pipeline, Duration::from_secs(30), None).with_inference_queue_capacity(1);
+        state.set_on_generation_step(hook);
+        let state = Arc::new(state);
+        let app = crate::build_router(Arc::clone(&state));
+
+        // Act -- one request is being read, one waits, a third arrives.
+        let first = tokio::spawn(app.clone().oneshot(infer_request("a b")));
+        until("the first generation", || started.load(Ordering::SeqCst) == 1).await;
+        let second = tokio::spawn(app.clone().oneshot(infer_request("b b")));
+        until("the second request to queue", || {
+            state.waiting_requests() == 1
+        })
+        .await;
+        let third = app
+            .clone()
+            .oneshot(infer_request("h i"))
+            .await
+            .expect("infallible");
+
+        // Assert
+        assert_eq!(third.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(third.headers()["retry-after"], "1");
+        assert_eq!(json_body(third).await["error"]["code"], "QUEUE_FULL");
+        drop(release);
+        for request in [first, second] {
+            let response = request.await.expect("task should join").expect("infallible");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["completion_tokens"], 4);
+        }
+        assert_eq!(state.waiting_requests(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_fails_waiting_requests_and_lets_the_running_batch_finish() {
+        // Arrange -- the hook holds the worker every time it asks a
+        // generation whether to go on: once when a request joins, then
+        // once per running generation at every token step.
+        let (hook, asked, release) = gated_hook();
+        let (pipeline, _dir) = batch_generation_pipeline(2, 4, false);
+        let state = state_for(pipeline, Duration::from_secs(30), None);
+        state.set_on_generation_step(hook);
+        let state = Arc::new(state);
+        let app = crate::build_router(Arc::clone(&state));
+        let let_go = |times: usize| {
+            for _ in 0..times {
+                release.send(()).expect("worker is waiting");
+            }
+        };
+        // A full batch of two: the first joins and takes a step, then the
+        // second joins.
+        let first = tokio::spawn(app.clone().oneshot(infer_request("a b")));
+        until("the first generation", || asked.load(Ordering::SeqCst) == 1).await;
+        let second = tokio::spawn(app.clone().oneshot(infer_request("b b")));
+        until("the second request to queue", || {
+            state.waiting_requests() == 1
+        })
+        .await;
+        let_go(3);
+        until("both generations to run", || state.active_generations() == 2).await;
+        // Two more wait. After one more step the worker has taken one of
+        // them off the queue and holds it until a place is free.
+        let waiting: Vec<_> = ["h i", "k"]
+            .iter()
+            .map(|text| tokio::spawn(app.clone().oneshot(infer_request(text))))
+            .collect();
+        until("two requests to wait", || state.waiting_requests() == 2).await;
+        let_go(2);
+        until("the next step", || asked.load(Ordering::SeqCst) == 6).await;
+
+        // Act
+        state.shutdown_inference();
+        let late = app
+            .clone()
+            .oneshot(infer_request("j k l"))
+            .await
+            .expect("infallible");
+        until("the queued request to be refused", || {
+            waiting.iter().any(|request| request.is_finished())
+        })
+        .await;
+        let running_were_unfinished = !first.is_finished() && !second.is_finished();
+        drop(release);
+
+        // Assert -- both waiting requests fail, the one the worker held
+        // included; the running ones finish.
+        assert_eq!(late.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(running_were_unfinished);
+        for request in waiting {
+            let response = request.await.expect("task should join").expect("infallible");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(json_body(response).await["error"]["code"], "NOT_READY");
+        }
+        for request in [first, second] {
+            let response = request.await.expect("task should join").expect("infallible");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["completion_tokens"], 4);
+        }
+        assert_eq!(state.waiting_requests(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_batcher_is_bypassed_when_generation_batches_itself() {
+        // Arrange -- BATCH_ENABLED and a generation batch width together.
+        let texts = ["b b", "a", "h i"];
+        let expected = solo_bodies(40, true, &texts).await;
+        let (batcher, receiver) = Batcher::new(4);
+        let (state, most, _dir) =
+            batch_generation_state(2, 40, true, Duration::from_millis(2), Some(batcher));
+        let batcher_task = tokio::spawn(batcher_loop(
+            receiver,
+            Arc::clone(&state),
+            4,
+            Duration::from_millis(200),
+        ));
+        let app = crate::build_router(Arc::clone(&state));
+
+        // Act
+        let requests: Vec<_> = texts
+            .iter()
+            .map(|text| {
+                let app = app.clone();
+                let text = (*text).to_string();
+                tokio::spawn(async move { infer_body(&app, &text).await })
+            })
+            .collect();
+
+        // Assert -- served by the worker's own batch; the batcher's task
+        // has nothing to wait for and ends.
+        assert!(!state.is_batching_enabled());
+        for (request, expected) in requests.into_iter().zip(&expected) {
+            assert_eq!(&request.await.expect("task should join"), expected);
+        }
+        assert_eq!(most.load(Ordering::SeqCst), 2);
+        batcher_task.await.expect("batcher loop should end");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_batcher_still_feeds_generation_of_width_one() {
+        // Arrange -- BATCH_ENABLED without a generation batch width.
+        let expected = solo_bodies(40, true, &["b b", "a"]).await;
+        let (batcher, receiver) = Batcher::new(2);
+        let (pipeline, _dir) = batch_generation_pipeline(1, 40, true);
+        let state = Arc::new(state_for(pipeline, Duration::from_secs(30), Some(batcher)));
+        let batcher_task = tokio::spawn(batcher_loop(
+            receiver,
+            Arc::clone(&state),
+            2,
+            Duration::from_millis(50),
+        ));
+        let app = crate::build_router(Arc::clone(&state));
+
+        // Act
+        let first = {
+            let app = app.clone();
+            tokio::spawn(async move { infer_body(&app, "b b").await })
+        };
+        let second = infer_body(&app, "a").await;
+
+        // Assert
+        assert!(state.is_batching_enabled());
+        assert_eq!(first.await.expect("task should join"), expected[0]);
+        assert_eq!(second, expected[1]);
+        batcher_task.abort();
+    }
+
     #[test]
     fn infer_request_deserializes_from_json() {
         // Arrange

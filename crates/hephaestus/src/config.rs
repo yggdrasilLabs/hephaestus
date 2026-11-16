@@ -10,7 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use hephaestus_core::{
     ExecutionProvider, SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS, Seq2SeqOptions,
-    TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT, TEXT_GENERATION_MIN_INPUT_TOKENS, TextGenerationOptions,
+    TEXT_GENERATION_MAX_BATCH_LIMIT, TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT,
+    TEXT_GENERATION_MIN_INPUT_TOKENS, TextGenerationOptions,
 };
 use serde::Deserialize;
 
@@ -607,6 +608,8 @@ const TEXT_GENERATION_MAX_INPUT_TOKENS_LIMIT: u32 = 32_768;
 /// - `TEXT_GENERATION_SYSTEM_PROMPT` -- system message for requests that
 ///   bring none. Unset or empty: no system message is sent, and the
 ///   model's chat template decides whether to add its own.
+/// - `TEXT_GENERATION_MAX_BATCH` -- how many requests may generate
+///   together, sharing each forward pass. Unset or 1: one at a time.
 #[derive(Deserialize, Debug, Default, PartialEq, Eq)]
 pub struct TextGenerationConfig {
     /// Prompt token cap (env `TEXT_GENERATION_MAX_INPUT_TOKENS`).
@@ -620,6 +623,10 @@ pub struct TextGenerationConfig {
     /// Default system message (env `TEXT_GENERATION_SYSTEM_PROMPT`).
     #[serde(default)]
     pub text_generation_system_prompt: Option<String>,
+
+    /// Requests that may generate together (env `TEXT_GENERATION_MAX_BATCH`).
+    #[serde(default)]
+    pub text_generation_max_batch: Option<u32>,
 }
 
 impl TextGenerationConfig {
@@ -654,6 +661,12 @@ impl TextGenerationConfig {
                 bail!("TEXT_GENERATION_MAX_NEW_TOKENS must be between 1 and {max} (got {tokens})");
             }
         }
+        if let Some(width) = self.text_generation_max_batch {
+            let max = TEXT_GENERATION_MAX_BATCH_LIMIT;
+            if width < 1 || width as usize > max {
+                bail!("TEXT_GENERATION_MAX_BATCH must be between 1 and {max} (got {width})");
+            }
+        }
         Ok(())
     }
 
@@ -679,6 +692,9 @@ impl TextGenerationConfig {
         }
         if let Some(prompt) = &self.text_generation_system_prompt {
             options = options.with_system_prompt(prompt.as_str());
+        }
+        if let Some(width) = self.text_generation_max_batch {
+            options = options.with_max_batch(width as usize);
         }
         options
     }
@@ -1369,6 +1385,7 @@ mod tests {
                 "TEXT_GENERATION_SYSTEM_PROMPT".to_string(),
                 "You summarize calls.\nBe brief.".to_string(),
             ),
+            ("TEXT_GENERATION_MAX_BATCH".to_string(), "4".to_string()),
             ("SEQ2SEQ_MAX_NEW_TOKENS".to_string(), "7".to_string()),
         ];
 
@@ -1376,6 +1393,7 @@ mod tests {
         let config: TextGenerationConfig = envy::from_iter(env).expect("should deserialize");
 
         // Assert -- the seq2seq variable is not this profile's business.
+        assert_eq!(config.text_generation_max_batch, Some(4));
         assert_eq!(config.text_generation_max_input_tokens, Some(2048));
         assert_eq!(config.text_generation_max_new_tokens, Some(400));
         assert_eq!(
@@ -1391,6 +1409,7 @@ mod tests {
                 .with_max_input_tokens(2048)
                 .with_max_new_tokens(400)
                 .with_system_prompt("You summarize calls.\nBe brief.")
+                .with_max_batch(4)
         );
     }
 
@@ -1427,6 +1446,19 @@ mod tests {
             let msg = format!("{}", config.validate().expect_err("token limit should be rejected"));
             assert!(msg.contains("TEXT_GENERATION_MAX_NEW_TOKENS"), "{msg}");
         }
+        for width in [0, TEXT_GENERATION_MAX_BATCH_LIMIT as u32 + 1] {
+            let config = TextGenerationConfig {
+                text_generation_max_batch: Some(width),
+                ..TextGenerationConfig::default()
+            };
+            let msg = format!("{}", config.validate().expect_err("batch width should be rejected"));
+            assert!(msg.contains("TEXT_GENERATION_MAX_BATCH"), "{msg}");
+        }
+        let widest = TextGenerationConfig {
+            text_generation_max_batch: Some(TEXT_GENERATION_MAX_BATCH_LIMIT as u32),
+            ..TextGenerationConfig::default()
+        };
+        assert!(widest.validate().is_ok());
     }
 
     #[test]

@@ -204,6 +204,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 text_generation_max_input_tokens = ?text_generation_config.text_generation_max_input_tokens,
                 text_generation_max_new_tokens = ?text_generation_config.text_generation_max_new_tokens,
                 text_generation_system_prompt_set = text_generation_config.text_generation_system_prompt.is_some(),
+                text_generation_max_batch = pipeline.max_batch(),
                 model_onnx_file = ?graph_config.graph_file(),
                 "text generation pipeline constructed"
             );
@@ -221,8 +222,18 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
 
-    // 5. Build shared state with optional batcher (D-07).
-    let batcher_handle = if config.batch_enabled {
+    // 5. Build shared state with optional batcher (D-07). A text
+    //    generation pipeline that batches its requests itself
+    //    (TEXT_GENERATION_MAX_BATCH above 1) takes them one by one between
+    //    token steps, so the dynamic batcher is left out.
+    let generation_batch = pipeline_kind.generation_batch_width();
+    if config.batch_enabled && generation_batch > 1 {
+        tracing::warn!(
+            text_generation_max_batch = generation_batch,
+            "BATCH_ENABLED is ignored: text generation batches its requests itself"
+        );
+    }
+    let batcher_handle = if config.batch_enabled && generation_batch <= 1 {
         let (batcher, receiver) = Batcher::new(config.batch_max_size as usize);
         Some((batcher, receiver))
     } else {

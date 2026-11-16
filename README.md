@@ -122,7 +122,7 @@ hephaestus/
 │   │   │   ├── routes.rs               # Axum router (/infer, /health, /metrics)
 │   │   │   ├── handlers.rs             # Request → inference → response
 │   │   │   ├── telemetry.rs            # OTel + Prometheus setup
-│   │   │   ├── worker.rs               # Inference worker thread + bounded job queue
+│   │   │   ├── worker.rs               # Inference worker thread + bounded job queue + generation batch
 │   │   │   └── batcher.rs              # Dynamic batching (configurable)
 │   │   └── tests/                      # API integration tests
 │   ├── hephaestus-resolve/             # Model resolution — storage, HuggingFace, Forge
@@ -170,6 +170,7 @@ hephaestus/
 | **`TEXT_GENERATION_MAX_INPUT_TOKENS`** | — | Text generation only. Cap on prompt tokens (chat template, system message and user text together), 16-32768; startup fails if it plus the new-token limit exceeds the model's context. Unset: 4096, or less when the model's context minus the new-token limit is smaller. A request above the cap is refused with HTTP 413; nothing is truncated. |
 | **`TEXT_GENERATION_MAX_NEW_TOKENS`** | — | Text generation only. Most tokens generated per request, 1-4096. Unset: `max_new_tokens` from `generation_config.json`, else 256. |
 | **`TEXT_GENERATION_SYSTEM_PROMPT`** | — | Text generation only. System message used when a request sends no `system` field. Unset: no system message. |
+| **`TEXT_GENERATION_MAX_BATCH`** | `1` | Text generation only. How many requests may generate together, sharing each forward pass, 1-64. `1` generates one request at a time, exactly as without the variable. Above 1 see [Batched generation](#batched-generation); `BATCH_ENABLED` is then ignored. Needs a graph with a key/value cache and an `attention_mask` input, else the width stays 1 (logged at startup). Cache memory grows with the width. |
 | **`MODEL_ONNX_FILE`** | — | Text generation only. File name of the graph to serve instead of `model.onnx` (for example `model_q4.onnx`). Only that graph and its external data files are fetched. Startup fails if it is set for another profile. |
 | **`OTEL_EXPORTER_OTLP_ENDPOINT`** | — | OTel collector endpoint (enables distributed tracing) |
 
@@ -242,7 +243,7 @@ curl -X POST http://localhost:8080/infer \
 - Decoding is greedy, with the key/value cache when the graph has one (float32 cache tensors only; fp16 cache graphs are rejected at startup). It stops at any `eos_token_id` of `generation_config.json` (else `config.json`), at the new-token limit, or with HTTP 504 after `REQUEST_TIMEOUT_SECS`. `repetition_penalty` and `no_repeat_ngram_size` are applied. Sampling settings (`do_sample`, `temperature`, `top_p`, `top_k`), beams and streaming are not implemented.
 - A prompt above the input cap (`TEXT_GENERATION_MAX_INPUT_TOKENS`) is refused with HTTP 413 and `{"error": {"code": "INPUT_TOO_LONG", "message": "input too long: the prompt has 5120 tokens, the limit is 4096"}}` (gRPC `INVALID_ARGUMENT`). The count covers the template, the system message and the user text. Nothing is truncated: shorten the text and send it again.
 - `prompt_tokens` and `completion_tokens` count the prompt as the model read it and the tokens it generated (the end token included).
-- One request generates at a time per replica; with `BATCH_ENABLED=true` the items of a batch run one after another. gRPC `Infer` works with the default system prompt only (the proto has no `system` field). Warmup generates one token; `WARMUP_INPUT` is not used.
+- One request generates at a time per replica unless `TEXT_GENERATION_MAX_BATCH` is above 1 (see [Batched generation](#batched-generation)); with `BATCH_ENABLED=true` and a width of 1 the items of a batch run one after another. gRPC `Infer` works with the default system prompt only (the proto has no `system` field). Warmup generates one token; `WARMUP_INPUT` is not used.
 - The resolver additionally fetches `tokenizer_config.json`, `generation_config.json` and `chat_template.jinja` when `config.json` names a causal LM. With `MODEL_ONNX_FILE` set, only that graph is looked up (`onnx/` then the repository root); there is no fallback to another variant or to Forge.
 
 ONNX external data: for every profile, the data files a graph names (`model.onnx_data`, `model_q4.onnx_data_1`, ...) are read from the graph file itself and fetched, cached and uploaded with it. A model whose data files are missing is never uploaded to storage, and an incomplete model in storage is treated as a cache miss.
@@ -307,11 +308,11 @@ curl -X POST http://localhost:8080/infer \
 
 ### Inference queue
 
-One thread per replica runs the model, one job at a time. `/infer`, gRPC `Infer` and the WebSocket endpoint put jobs on a bounded queue (`INFERENCE_QUEUE_CAPACITY`) and wait for the result; tokenization happens before queueing and never waits for the model.
+One thread per replica runs the model, one job at a time (text generation with `TEXT_GENERATION_MAX_BATCH` above 1: one batch of generations, see [Batched generation](#batched-generation)). `/infer`, gRPC `Infer` and the WebSocket endpoint put jobs on a bounded queue (`INFERENCE_QUEUE_CAPACITY`) and wait for the result; tokenization happens before queueing and never waits for the model.
 
 - Queue full: the request is refused at once with HTTP 503, `Retry-After: 1` and `{"error": {"code": "QUEUE_FULL", ...}}` (gRPC `UNAVAILABLE`). The readiness probe is not affected.
 - A job whose `REQUEST_TIMEOUT_SECS` deadline passes while it is queued, or whose client has gone, is removed without running.
-- On SIGTERM the job that is running finishes; queued jobs and new requests get 503 `NOT_READY`.
+- On SIGTERM the job that is running finishes (every generation of a running batch); queued jobs and new requests get 503 `NOT_READY`.
 - With `BATCH_ENABLED=true` requests wait in the batcher's channel instead (4 × `BATCH_MAX_SIZE`, senders wait rather than being refused); each batch is one job.
 
 A request that times out or whose client disconnects while its generation is running (text generation, encoder-decoder seq2seq) stops that generation before the next token, so the next job starts at once. This holds for HTTP, gRPC and batched requests. A single forward pass (every other profile) cannot be interrupted and runs to its end.
@@ -328,6 +329,20 @@ Metrics, all labelled `model_id`:
 | `hephaestus_prompt_tokens_total` | counter | Prompt tokens read by finished generations |
 | `hephaestus_generated_tokens_total` | counter | Tokens generated by finished generations |
 | `hephaestus_generation_tokens_per_second` | histogram | Generated tokens divided by the time of the whole run (prompt processing included), per finished generation |
+| `hephaestus_generation_batch_sequences` | histogram | Batched generation only. Sequences in one forward pass; `pass` is `decode` (a token step of the running batch) or `prompt` (the pass that reads the prompts of joining requests) |
+| `hephaestus_generation_active_sequences` | gauge | Batched generation only. Generations running together right now |
+
+### Batched generation
+
+With `TEXT_GENERATION_MAX_BATCH` above 1 the worker runs up to that many text generation requests together: one forward pass per token step for all of them.
+
+- **Joining.** Between two token steps the worker takes waiting requests off the queue while the batch has a free place. Their prompts are read in one extra forward pass over the new prompts only (the running generations wait for that pass), and they decode with the others from the next step on.
+- **Leaving.** A request is answered in the step it ends: end token, new-token limit, its deadline (504), or its caller going away. The others go on and its place is free at once. A failed forward pass fails every request that was in it.
+- **Same output as alone.** Rows are padded on the left and the padding is masked, so each request gets the tokens it gets alone. On a real model the logits of a padded row differ from the solo run in the last bits (other positions, other tensor shapes), so a near tie between two tokens can fall the other way; the test graphs compute in whole numbers and match exactly.
+- **Which requests run together.** A graph without a `position_ids` input counts positions by column, so a row can never be moved once it has started, and a request can only join a batch at least as wide (in tokens) as its prompt. A request with a longer prompt waits until the batch has grown that far or has emptied, and requests behind it wait with it (arrival order is kept). A request is also not put into a batch where its row would be more than half padding at its longest (padding above prompt + new-token limit), nor into one already wider than `TEXT_GENERATION_MAX_INPUT_TOKENS`. Prompts of similar length batch best.
+- **`BATCH_ENABLED`.** Ignored for a text generation model with a width above 1 (a warning is logged): the dynamic batcher hands over closed batches, which would make each request wait for the batch before it. Requests then use the inference queue, so `INFERENCE_QUEUE_CAPACITY` applies and a full queue is a 503. Other profiles, and text generation with a width of 1, batch as before.
+- **Queue and metrics.** `INFERENCE_QUEUE_CAPACITY` still counts waiting requests only; the width is on top. `hephaestus_stage_duration_seconds{stage="inference"}` and `hephaestus_generation_tokens_per_second` cover a request from joining to leaving, so per-request token rates fall as the width grows while the total rises.
+- **Memory.** The cache holds `width × columns` positions, padding included, and columns never exceed max input tokens + max new tokens. So each place in the batch can cost what one worst-case request costs alone, and twice that for a moment while the cache is copied because a request joined or left.
 
 ### Kubernetes deployment (one model per pod)
 
