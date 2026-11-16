@@ -4,8 +4,10 @@ resolver = "3"
 
 [workspace.dependencies]
 # ONNX inference
-ort = "2.0.0-rc.13"
+ort = { version = "2.0.0-rc.13", features = ["half"] }
 ndarray = "0.17"
+# float16 tensors of half-precision graphs
+half = "2.1"
 
 # Tokenization
 tokenizers = "0.23"

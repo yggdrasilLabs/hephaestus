@@ -28,6 +28,15 @@ async fn main() -> Result<(), anyhow::Error> {
     let config = config::Config::from_env()?;
     config.validate()?;
     let ep: ExecutionProvider = config.parsed_execution_provider()?;
+    // CUDA settings apply to every session, so they are set before the
+    // first one is built. Read only when CUDA was asked for.
+    let cuda_settings = if ep == ExecutionProvider::Cuda {
+        let settings = config::CudaConfig::from_env()?.settings()?;
+        hephaestus_core::ep::configure_cuda(settings);
+        Some(settings)
+    } else {
+        None
+    };
     let graph_config = config::GraphConfig::from_env()?;
     graph_config.validate()?;
 
@@ -41,6 +50,9 @@ async fn main() -> Result<(), anyhow::Error> {
     tracing::info!(
         model_id = %config.model_id,
         execution_provider = %ep,
+        cuda_device_id = ?cuda_settings.map(|cuda| cuda.device_id),
+        cuda_memory_limit_bytes = ?cuda_settings.and_then(|cuda| cuda.memory_limit_bytes),
+        cuda_arena_extend_strategy = ?cuda_settings.map(|cuda| cuda.arena_extend_strategy.to_string()),
         port = config.port,
         request_timeout_secs = config.request_timeout_secs,
         inference_queue_capacity = config.inference_queue_capacity,
@@ -205,6 +217,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 text_generation_max_new_tokens = ?text_generation_config.text_generation_max_new_tokens,
                 text_generation_system_prompt_set = text_generation_config.text_generation_system_prompt.is_some(),
                 text_generation_max_batch = pipeline.max_batch(),
+                text_generation_device_cache = pipeline.keeps_cache_on_device(),
                 model_onnx_file = ?graph_config.graph_file(),
                 "text generation pipeline constructed"
             );

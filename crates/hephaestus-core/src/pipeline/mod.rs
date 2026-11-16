@@ -4,11 +4,15 @@ mod asr;
 mod chat_template;
 mod classifier;
 mod control;
+mod device_run;
 mod embeddings;
 mod encoder_decoder;
+mod float;
 mod generation_batch;
 mod kv_cache;
 mod preparer;
+#[cfg(test)]
+mod provider_tests;
 mod seq2seq;
 mod text_generation;
 mod token_classifier;
@@ -317,13 +321,29 @@ fn resolve_onnx_path(model_dir: &Path, filename: &str) -> Result<PathBuf, CoreEr
 /// Build an ONNX Runtime session from a model file path.
 ///
 /// Creates a session with Level3 graph optimization and the requested
-/// execution providers. Shared by all pipeline constructors.
+/// execution provider. Shared by all pipeline constructors.
+///
+/// A provider other than the CPU is never replaced by the CPU: if it
+/// cannot be registered (its libraries or the driver are missing) or the
+/// session cannot be created on it (no usable device), this fails. The
+/// provider the session was created with is logged. Nodes the provider
+/// has no kernel for still run on the CPU, as ONNX Runtime always
+/// arranges; that is not a fallback of the session.
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::ModelLoad`] if the session cannot be created.
+/// Returns [`CoreError::Config`] if the provider's Cargo feature is not
+/// compiled in and [`CoreError::ModelLoad`] if the provider cannot be set
+/// up or the session cannot be created.
 fn build_onnx_session(path: &Path, ep: &ExecutionProvider) -> Result<Session, CoreError> {
     let providers = ep.to_ort_providers()?;
+    let unusable = |stage: &str, error: &dyn std::fmt::Display| {
+        CoreError::ModelLoad(format!(
+            "execution provider '{ep}' ({}) was requested but {stage}; hephaestus does not fall \
+             back to the CPU (set EXECUTION_PROVIDER=cpu to run on it): {error}",
+            ep.ort_name(),
+        ))
+    };
 
     let mut builder = Session::builder()
         .map_err(|e| CoreError::ModelLoad(e.to_string()))?
@@ -333,12 +353,23 @@ fn build_onnx_session(path: &Path, ep: &ExecutionProvider) -> Result<Session, Co
     if !providers.is_empty() {
         builder = builder
             .with_execution_providers(providers)
-            .map_err(|e| CoreError::ModelLoad(e.to_string()))?;
+            .map_err(|e| unusable("could not be registered", &e))?;
     }
 
-    builder
-        .commit_from_file(path)
-        .map_err(|e| CoreError::ModelLoad(e.to_string()))
+    let session = builder.commit_from_file(path).map_err(|e| {
+        if *ep == ExecutionProvider::Cpu {
+            CoreError::ModelLoad(e.to_string())
+        } else {
+            unusable("the session could not be created with it", &e)
+        }
+    })?;
+    tracing::info!(
+        model = %path.display(),
+        requested = %ep,
+        execution_provider = ep.ort_name(),
+        "onnx session created"
+    );
+    Ok(session)
 }
 
 /// Load an ONNX session from a model directory.

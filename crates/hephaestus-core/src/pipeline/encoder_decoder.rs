@@ -29,6 +29,7 @@ use crate::ep::ExecutionProvider;
 use crate::error::CoreError;
 
 use super::control::{GenerationControl, tokens_per_second};
+use super::float::{FloatType, float_tensor};
 use super::seq2seq::Seq2SeqOptions;
 use super::{PreparedInput, build_onnx_session};
 
@@ -196,6 +197,35 @@ fn require_element_type(
     )))
 }
 
+/// Require that a graph input or output is `float32` or `float16`.
+fn require_float(graph: &str, spec: &TensorSpec) -> Result<FloatType, CoreError> {
+    FloatType::of(spec.element_type).ok_or_else(|| {
+        CoreError::ModelValidation(format!(
+            "{graph} tensor '{}' has element type {:?}, but encoder-decoder mode needs Float32 \
+             or Float16",
+            spec.name, spec.element_type,
+        ))
+    })
+}
+
+/// Require that a decoder tensor has the float type of the encoder
+/// hidden states the decoder takes.
+fn require_decoder_float(
+    spec: &TensorSpec,
+    expected: FloatType,
+    hidden: &TensorSpec,
+) -> Result<(), CoreError> {
+    let found = require_float("decoder", spec)?;
+    if found == expected {
+        return Ok(());
+    }
+    Err(CoreError::ModelValidation(format!(
+        "decoder tensor '{}' is {found:?} but '{}' is {expected:?}; encoder-decoder mode needs \
+         one float type for the hidden states and the key/value cache",
+        spec.name, hidden.name,
+    )))
+}
+
 /// How to feed the encoder graph and where to read its result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EncoderIo {
@@ -203,6 +233,8 @@ struct EncoderIo {
     feeds_attention_mask: bool,
     /// Name of the hidden-state output handed to the decoder.
     hidden_output: String,
+    /// Float type of the hidden states.
+    hidden_type: FloatType,
 }
 
 impl EncoderIo {
@@ -245,11 +277,12 @@ impl EncoderIo {
             .ok_or_else(|| {
                 CoreError::ModelValidation("encoder declares no output tensors".to_string())
             })?;
-        require_element_type("encoder", hidden, TensorElementType::Float32)?;
+        let hidden_type = require_float("encoder", hidden)?;
 
         Ok(Self {
             feeds_attention_mask,
             hidden_output: hidden.name.clone(),
+            hidden_type,
         })
     }
 }
@@ -272,12 +305,6 @@ struct PastInput {
     /// between steps, and the cached branch of an Optimum merged decoder
     /// returns an empty tensor for it, so the first step's tensor is kept.
     from_encoder: bool,
-}
-
-impl PastInput {
-    fn element_count(&self) -> usize {
-        self.dims.iter().product()
-    }
 }
 
 /// Extra inputs of a merged decoder.
@@ -310,6 +337,9 @@ struct DecoderIo {
     merged: Option<MergedInputs>,
     /// Output holding next-token logits.
     logits_output: String,
+    /// Float type of the encoder hidden states the graph takes and of
+    /// its key/value cache. The logits may be of the other float type.
+    float: FloatType,
 }
 
 impl DecoderIo {
@@ -343,7 +373,7 @@ impl DecoderIo {
                 spec_names(inputs),
             ))
         })?;
-        require_element_type("decoder", hidden, TensorElementType::Float32)?;
+        let float = require_float("decoder", hidden)?;
 
         let mut encoder_mask_input = None;
         let mut use_cache_branch = None;
@@ -360,7 +390,7 @@ impl DecoderIo {
                 require_element_type("decoder", spec, TensorElementType::Bool)?;
                 use_cache_branch = Some(spec.name.clone());
             } else if let Some(slot) = name.strip_prefix(PAST_INPUT_PREFIX) {
-                require_element_type("decoder", spec, TensorElementType::Float32)?;
+                require_decoder_float(spec, float, hidden)?;
                 let present = format!("{PRESENT_OUTPUT_PREFIX}{slot}");
                 past.push(PastInput {
                     name: spec.name.clone(),
@@ -368,7 +398,7 @@ impl DecoderIo {
                         .iter()
                         .any(|output| {
                             output.name == present
-                                && output.element_type == Some(TensorElementType::Float32)
+                                && FloatType::of(output.element_type) == Some(float)
                         })
                         .then_some(present),
                     from_encoder: name.contains(ENCODER_CACHE_MARKER),
@@ -411,7 +441,7 @@ impl DecoderIo {
                     spec_names(outputs),
                 ))
             })?;
-        require_element_type("decoder", logits, TensorElementType::Float32)?;
+        require_float("decoder", logits)?;
 
         Ok(Self {
             tokens_input: tokens.name.clone(),
@@ -419,6 +449,7 @@ impl DecoderIo {
             encoder_mask_input,
             merged,
             logits_output: logits.name.clone(),
+            float,
         })
     }
 }
@@ -743,8 +774,9 @@ pub(super) struct EncoderDecoder {
     settings: GenerationSettings,
     /// Time budget for one input, measured from the start of its encoder pass.
     timeout: Option<Duration>,
-    /// Zeros backing the dummy cache inputs of a merged decoder.
-    past_zeros: Vec<f32>,
+    /// Zeros for the dummy cache inputs of a merged decoder, one tensor
+    /// per cache input.
+    past_zeros: Vec<DynValue>,
     /// Whether generation keeps a key/value cache between decoder steps.
     kv_cache: bool,
 }
@@ -805,20 +837,31 @@ impl EncoderDecoder {
                 .as_ref()
                 .is_some_and(MergedInputs::supports_cache);
 
-        let past_zeros = decoder_io.merged.as_ref().map_or_else(Vec::new, |merged| {
-            let longest = merged
-                .past
-                .iter()
-                .map(PastInput::element_count)
-                .max()
-                .unwrap_or(0);
-            vec![0.0; longest]
-        });
+        if encoder_io.hidden_type != decoder_io.float {
+            return Err(CoreError::ModelValidation(format!(
+                "encoder output '{}' is {:?} but decoder input '{}' is {:?}; the two graphs must \
+                 use one float type for the encoder hidden states",
+                encoder_io.hidden_output,
+                encoder_io.hidden_type,
+                decoder_io.encoder_hidden_input,
+                decoder_io.float,
+            )));
+        }
+
+        let past_zeros = decoder_io
+            .merged
+            .as_ref()
+            .map_or(&[][..], |merged| merged.past.as_slice())
+            .iter()
+            .map(|past| decoder_io.float.zeros(&past.dims))
+            .collect::<Result<Vec<_>, CoreError>>()
+            .map_err(|e| CoreError::ModelLoad(e.to_string()))?;
 
         tracing::info!(
             encoder = %files.encoder.display(),
             decoder = %decoder_path.display(),
             merged_decoder = decoder_io.merged.is_some(),
+            float_type = ?decoder_io.float,
             kv_cache,
             max_input_tokens,
             max_new_tokens = settings.max_new_tokens,
@@ -912,10 +955,9 @@ impl EncoderDecoder {
                     self.encoder_io.hidden_output,
                 ))
             })?;
-        let (hidden_shape, hidden_data) = hidden
-            .try_extract_tensor::<f32>()
-            .map_err(|e| CoreError::Inference(e.to_string()))?;
-        let hidden_dims: Vec<i64> = hidden_shape.iter().copied().collect();
+        // Fed to the decoder as the encoder returned it, in either float
+        // type.
+        let hidden_dims: Vec<i64> = hidden.shape().iter().copied().collect();
         if hidden_dims.len() != 3 || hidden_dims[0] != 1 {
             return Err(CoreError::Inference(format!(
                 "expected encoder output of shape (1, seq, hidden), got {hidden_dims:?}",
@@ -937,6 +979,8 @@ impl EncoderDecoder {
         // number of decoder tokens they cover. Local to this input.
         let mut cache: Vec<DynValue> = Vec::new();
         let mut cached_len = 0_usize;
+        // float16 logits of the last position, widened.
+        let mut widened: Vec<f32> = Vec::new();
         let generated = greedy_decode(settings, control, |tokens, banned| {
             // The cached branch takes exactly the one token the cache does
             // not cover yet. Anything else (the first step, which may hold
@@ -954,9 +998,7 @@ impl EncoderDecoder {
             ));
             inputs.push((
                 Cow::Borrowed(decoder_io.encoder_hidden_input.as_str()),
-                TensorRef::from_array_view((hidden_dims.as_slice(), hidden_data))
-                    .map_err(|e| CoreError::Inference(e.to_string()))?
-                    .into(),
+                hidden.into(),
             ));
             if let Some(name) = &decoder_io.encoder_mask_input {
                 inputs.push((
@@ -975,12 +1017,7 @@ impl EncoderDecoder {
                     let value: SessionInputValue<'_> = if reuse {
                         (&cache[index]).into()
                     } else {
-                        TensorRef::from_array_view((
-                            past.dims.as_slice(),
-                            &past_zeros[..past.element_count()],
-                        ))
-                        .map_err(|e| CoreError::Inference(e.to_string()))?
-                        .into()
+                        (&past_zeros[index]).into()
                     };
                     inputs.push((Cow::Borrowed(past.name.as_str()), value));
                 }
@@ -995,10 +1032,8 @@ impl EncoderDecoder {
                     decoder_io.logits_output,
                 ))
             })?;
-            let (shape, data) = logits
-                .try_extract_tensor::<f32>()
-                .map_err(|e| CoreError::Inference(e.to_string()))?;
-            let vocab_size = match shape.iter().copied().collect::<Vec<i64>>().as_slice() {
+            let (shape, data) = float_tensor(logits)?;
+            let vocab_size = match shape.as_slice() {
                 [1, _, vocab] => usize::try_from(*vocab).ok().filter(|&size| size > 0),
                 _ => None,
             }
@@ -1014,7 +1049,8 @@ impl EncoderDecoder {
                     data.len(),
                 ))
             })?;
-            let token = argmax_excluding(&data[last_position..], banned)?;
+            let token =
+                argmax_excluding(data.widen(last_position..data.len(), &mut widened), banned)?;
 
             if kv_cache && let Some(merged) = &decoder_io.merged {
                 if !reuse {
@@ -1464,7 +1500,6 @@ mod tests {
         assert_eq!(merged.use_cache_branch, "use_cache_branch");
         assert_eq!(merged.past.len(), 1);
         assert_eq!(merged.past[0].dims, vec![1, 16, 1, 64]);
-        assert_eq!(merged.past[0].element_count(), 1024);
     }
 
     /// The inputs and outputs of Optimum's merged BART decoder, one layer.

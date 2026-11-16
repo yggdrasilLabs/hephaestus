@@ -8,6 +8,7 @@ use std::path::{Component, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use hephaestus_core::ep::{CudaArenaExtendStrategy, CudaSettings};
 use hephaestus_core::{
     ExecutionProvider, SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS, Seq2SeqOptions,
     TEXT_GENERATION_MAX_BATCH_LIMIT, TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT,
@@ -610,6 +611,10 @@ const TEXT_GENERATION_MAX_INPUT_TOKENS_LIMIT: u32 = 32_768;
 ///   model's chat template decides whether to add its own.
 /// - `TEXT_GENERATION_MAX_BATCH` -- how many requests may generate
 ///   together, sharing each forward pass. Unset or 1: one at a time.
+/// - `TEXT_GENERATION_DEVICE_CACHE` -- where the key/value cache is kept
+///   between steps: `on` (on the device the session computes on), `off`
+///   (in host memory) or `auto`. Unset or `auto`: on the device with
+///   `EXECUTION_PROVIDER=cuda`, in host memory otherwise.
 #[derive(Deserialize, Debug, Default, PartialEq, Eq)]
 pub struct TextGenerationConfig {
     /// Prompt token cap (env `TEXT_GENERATION_MAX_INPUT_TOKENS`).
@@ -627,6 +632,11 @@ pub struct TextGenerationConfig {
     /// Requests that may generate together (env `TEXT_GENERATION_MAX_BATCH`).
     #[serde(default)]
     pub text_generation_max_batch: Option<u32>,
+
+    /// Where the key/value cache is kept (env `TEXT_GENERATION_DEVICE_CACHE`:
+    /// `auto`, `on` or `off`).
+    #[serde(default)]
+    pub text_generation_device_cache: Option<String>,
 }
 
 impl TextGenerationConfig {
@@ -667,7 +677,30 @@ impl TextGenerationConfig {
                 bail!("TEXT_GENERATION_MAX_BATCH must be between 1 and {max} (got {width})");
             }
         }
+        self.device_cache()?;
         Ok(())
+    }
+
+    /// The parsed `TEXT_GENERATION_DEVICE_CACHE`: `Some(true)` for `on`,
+    /// `Some(false)` for `off`, `None` for `auto` or unset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any other value.
+    pub fn device_cache(&self) -> Result<Option<bool>, anyhow::Error> {
+        match self
+            .text_generation_device_cache
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("auto") => Ok(None),
+            Some("on") => Ok(Some(true)),
+            Some("off") => Ok(Some(false)),
+            Some(other) => {
+                bail!("TEXT_GENERATION_DEVICE_CACHE must be auto, on or off (got '{other}')")
+            }
+        }
     }
 
     /// Build the pipeline options for these settings.
@@ -696,7 +729,89 @@ impl TextGenerationConfig {
         if let Some(width) = self.text_generation_max_batch {
             options = options.with_max_batch(width as usize);
         }
+        // An unreadable value is refused by `validate`; here it is `auto`.
+        if let Ok(Some(device_cache)) = self.device_cache() {
+            options = options.with_device_cache(device_cache);
+        }
         options
+    }
+}
+
+/// Largest accepted `CUDA_DEVICE_ID`.
+const CUDA_DEVICE_ID_LIMIT: u32 = 255;
+
+/// CUDA settings deserialized from environment variables.
+///
+/// Kept apart from [`Config`] and loaded only when `EXECUTION_PROVIDER`
+/// is `cuda`. All are optional.
+///
+/// - `CUDA_DEVICE_ID` -- index of the GPU to run on. Unset: 0.
+/// - `CUDA_MEMORY_LIMIT_MB` -- cap on the device memory arena of the model
+///   session, in MiB. Unset: no cap. An allocation beyond it fails the
+///   request that needed it instead of exhausting the device.
+/// - `CUDA_ARENA_EXTEND_STRATEGY` -- how that arena grows:
+///   `next_power_of_two` (in chunks that double) or `same_as_requested`
+///   (by exactly what is needed). Unset: `next_power_of_two`, ONNX
+///   Runtime's default.
+#[derive(Deserialize, Debug, Default, PartialEq, Eq)]
+pub struct CudaConfig {
+    /// GPU index (env `CUDA_DEVICE_ID`).
+    #[serde(default)]
+    pub cuda_device_id: Option<u32>,
+
+    /// Arena cap in MiB (env `CUDA_MEMORY_LIMIT_MB`).
+    #[serde(default)]
+    pub cuda_memory_limit_mb: Option<u64>,
+
+    /// Arena growth (env `CUDA_ARENA_EXTEND_STRATEGY`).
+    #[serde(default)]
+    pub cuda_arena_extend_strategy: Option<String>,
+}
+
+impl CudaConfig {
+    /// Load CUDA settings from environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a numeric variable is set to something other
+    /// than a non-negative integer.
+    pub fn from_env() -> Result<Self, anyhow::Error> {
+        envy::from_env::<Self>().context("failed to load CUDA config from environment")
+    }
+
+    /// The settings for the CUDA execution provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the device index is above 255, the memory
+    /// limit is zero or does not fit the address space, or the strategy
+    /// is not one of the two names.
+    pub fn settings(&self) -> Result<CudaSettings, anyhow::Error> {
+        let device_id = self.cuda_device_id.unwrap_or(0);
+        if device_id > CUDA_DEVICE_ID_LIMIT {
+            bail!("CUDA_DEVICE_ID must be between 0 and {CUDA_DEVICE_ID_LIMIT} (got {device_id})");
+        }
+        let memory_limit_bytes = match self.cuda_memory_limit_mb {
+            None => None,
+            Some(0) => bail!("CUDA_MEMORY_LIMIT_MB must be at least 1 (unset it for no limit)"),
+            Some(megabytes) => Some(
+                megabytes
+                    .checked_mul(1024 * 1024)
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+                    .with_context(|| format!("CUDA_MEMORY_LIMIT_MB is too large ({megabytes})"))?,
+            ),
+        };
+        let arena_extend_strategy = match &self.cuda_arena_extend_strategy {
+            None => CudaArenaExtendStrategy::default(),
+            Some(name) => name
+                .parse()
+                .context("invalid CUDA_ARENA_EXTEND_STRATEGY value")?,
+        };
+        Ok(CudaSettings {
+            device_id: device_id as i32,
+            memory_limit_bytes,
+            arena_extend_strategy,
+        })
     }
 }
 
@@ -1386,6 +1501,10 @@ mod tests {
                 "You summarize calls.\nBe brief.".to_string(),
             ),
             ("TEXT_GENERATION_MAX_BATCH".to_string(), "4".to_string()),
+            (
+                "TEXT_GENERATION_DEVICE_CACHE".to_string(),
+                "Off".to_string(),
+            ),
             ("SEQ2SEQ_MAX_NEW_TOKENS".to_string(), "7".to_string()),
         ];
 
@@ -1410,7 +1529,122 @@ mod tests {
                 .with_max_new_tokens(400)
                 .with_system_prompt("You summarize calls.\nBe brief.")
                 .with_max_batch(4)
+                .with_device_cache(false)
         );
+    }
+
+    #[test]
+    fn text_generation_device_cache_is_auto_on_or_off() {
+        let with = |value: Option<&str>| TextGenerationConfig {
+            text_generation_device_cache: value.map(str::to_string),
+            ..TextGenerationConfig::default()
+        };
+        let plain = TextGenerationOptions::new().with_timeout(Duration::from_secs(30));
+
+        // Unset and `auto` leave the choice to the pipeline.
+        for value in [None, Some("auto"), Some("AUTO")] {
+            let config = with(value);
+            assert_eq!(config.device_cache().unwrap(), None);
+            assert_eq!(config.options(Duration::from_secs(30), None), plain);
+        }
+        assert_eq!(with(Some("on")).device_cache().unwrap(), Some(true));
+        assert_eq!(
+            with(Some("on")).options(Duration::from_secs(30), None),
+            plain.clone().with_device_cache(true)
+        );
+        assert_eq!(with(Some("off")).device_cache().unwrap(), Some(false));
+        let msg = with(Some("gpu")).validate().unwrap_err().to_string();
+        assert!(msg.contains("TEXT_GENERATION_DEVICE_CACHE"), "{msg}");
+        assert!(msg.contains("auto, on or off"), "{msg}");
+    }
+
+    #[test]
+    fn cuda_config_defaults_to_device_zero_without_a_memory_limit() {
+        // Arrange -- no CUDA_* variable set.
+        let config: CudaConfig =
+            envy::from_iter(vec![("MODEL_ID".to_string(), "test/model".to_string())])
+                .expect("should deserialize");
+
+        // Act
+        let settings = config.settings().expect("defaults are valid");
+
+        // Assert
+        assert_eq!(config, CudaConfig::default());
+        assert_eq!(settings, CudaSettings::default());
+        assert_eq!(settings.device_id, 0);
+        assert_eq!(settings.memory_limit_bytes, None);
+        assert_eq!(
+            settings.arena_extend_strategy,
+            CudaArenaExtendStrategy::NextPowerOfTwo
+        );
+    }
+
+    #[test]
+    fn cuda_config_reads_every_variable() {
+        // Arrange
+        let env = vec![
+            ("CUDA_DEVICE_ID".to_string(), "1".to_string()),
+            ("CUDA_MEMORY_LIMIT_MB".to_string(), "20480".to_string()),
+            (
+                "CUDA_ARENA_EXTEND_STRATEGY".to_string(),
+                "same_as_requested".to_string(),
+            ),
+        ];
+
+        // Act
+        let config: CudaConfig = envy::from_iter(env).expect("should deserialize");
+        let settings = config.settings().expect("valid");
+
+        // Assert
+        assert_eq!(
+            settings,
+            CudaSettings {
+                device_id: 1,
+                memory_limit_bytes: Some(20_480 * 1024 * 1024),
+                arena_extend_strategy: CudaArenaExtendStrategy::SameAsRequested,
+            }
+        );
+    }
+
+    #[test]
+    fn cuda_config_rejects_unusable_values() {
+        let cases = [
+            (
+                CudaConfig {
+                    cuda_device_id: Some(256),
+                    ..CudaConfig::default()
+                },
+                "CUDA_DEVICE_ID",
+            ),
+            (
+                CudaConfig {
+                    cuda_memory_limit_mb: Some(0),
+                    ..CudaConfig::default()
+                },
+                "CUDA_MEMORY_LIMIT_MB",
+            ),
+            (
+                CudaConfig {
+                    cuda_memory_limit_mb: Some(u64::MAX),
+                    ..CudaConfig::default()
+                },
+                "CUDA_MEMORY_LIMIT_MB",
+            ),
+            (
+                CudaConfig {
+                    cuda_arena_extend_strategy: Some("double".to_string()),
+                    ..CudaConfig::default()
+                },
+                "CUDA_ARENA_EXTEND_STRATEGY",
+            ),
+        ];
+
+        for (config, variable) in cases {
+            let msg = format!("{:#}", config.settings().unwrap_err());
+            assert!(msg.contains(variable), "{msg}");
+        }
+        let env = vec![("CUDA_DEVICE_ID".to_string(), "first".to_string())];
+        assert!(envy::from_iter::<_, CudaConfig>(env).is_err());
     }
 
     #[test]

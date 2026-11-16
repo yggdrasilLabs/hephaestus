@@ -449,3 +449,76 @@ fn spent_time_budget_fails_with_timeout_with_cache() {
         "expected a timeout, got: {result:?}"
     );
 }
+
+// --- Half precision ---
+
+/// The full export in half precision (`fixtures/seq2seq/fp16`, see
+/// `make_fixtures_fp16.py`): float16 hidden states, cache and logits.
+fn half_precision_dir(config: &serde_json::Value) -> TempDir {
+    model_dir(
+        config,
+        &[
+            ("fp16/encoder_model.onnx", ENCODER),
+            ("fp16/decoder_model.onnx", DECODER),
+            ("fp16/decoder_model_merged_cached.onnx", MERGED_DECODER),
+        ],
+    )
+}
+
+#[test]
+fn half_precision_export_generates_the_text_of_the_full_precision_one() {
+    for (name, config) in configs() {
+        // Arrange -- the graphs compute in whole numbers, which float16
+        // holds exactly, so every token must be the same.
+        let mut full = load(&full_export_dir(&config));
+        let half_dir = half_precision_dir(&config);
+        let mut cached = load(&half_dir);
+        let mut uncached = load_with(&half_dir, &Seq2SeqOptions::new().with_kv_cache(false));
+        assert!(cached.uses_kv_cache(), "{name}: cache should be on");
+        assert!(!uncached.uses_kv_cache(), "{name}: cache should be off");
+
+        for input in INPUTS {
+            // Act
+            let expected = generate(&mut full, input).expect("float32 generation");
+            let with_cache = generate(&mut cached, input).expect("float16 cached generation");
+            let without_cache = generate(&mut uncached, input).expect("float16 generation");
+
+            // Assert
+            assert_eq!(with_cache, expected, "{name}: cached, input '{input}'");
+            assert_eq!(without_cache, expected, "{name}: uncached, input '{input}'");
+        }
+    }
+}
+
+#[test]
+fn encoder_and_decoder_of_different_float_types_fail_at_startup() {
+    // Arrange -- a float16 encoder in front of float32 decoders, and the
+    // other way round.
+    let pairs = [
+        ("fp16/encoder_model.onnx", DECODER, CACHED_MERGED_FIXTURE),
+        (
+            ENCODER,
+            "fp16/decoder_model.onnx",
+            "fp16/decoder_model_merged_cached.onnx",
+        ),
+    ];
+
+    for (encoder, decoder, merged) in pairs {
+        let dir = model_dir(
+            &base_config(),
+            &[
+                (encoder, ENCODER),
+                (decoder, DECODER),
+                (merged, MERGED_DECODER),
+            ],
+        );
+
+        // Act
+        let result = Seq2SeqPipeline::new(dir.path(), &ExecutionProvider::Cpu);
+
+        // Assert
+        let error = result.err().expect("mixed float types should be rejected");
+        assert!(matches!(error, CoreError::ModelValidation(_)), "{error:?}");
+        assert!(error.to_string().contains("one float type"), "{error}");
+    }
+}

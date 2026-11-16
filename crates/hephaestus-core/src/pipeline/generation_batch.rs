@@ -42,7 +42,14 @@
 //!
 //! When a row leaves, the cache of the others is copied to a tensor with
 //! fewer rows; when rows join, to one with more. Between such changes the
-//! cache a step returns is fed to the next step untouched.
+//! cache a step returns is fed to the next step untouched. The copy is
+//! made where the cache lives: by the host for a cache in host memory, on
+//! the device for one that stays there (`kv_cache.rs`, `device_run.rs`).
+//! Both forward passes ([`TextGenerationPipeline::read_prompts`] and
+//! [`TextGenerationPipeline::decode_step`]) run either through
+//! `Session::run` or, with the cache on the device, through the
+//! pipeline's `DeviceRun`; rows, padding, masks and positions are the
+//! same in both.
 //!
 //! What cannot be promised is bit-equal logits on a real model: a padded
 //! row is computed at other positions and in other tensor shapes than the
@@ -54,15 +61,17 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use ort::session::{SessionInputValue, SessionOutputs};
-use ort::value::TensorRef;
+use ort::session::{Session, SessionInputValue};
+use ort::value::{DynValue, TensorRef};
 use tokenizers::Tokenizer;
 
 use crate::error::CoreError;
 
 use super::control::{Execution, GenerationControl, TokenUsage, tokens_per_second};
-use super::kv_cache::{KvCache, RowPick};
-use super::text_generation::{GenerationSettings, TextGenerationPipeline, TokenScratch};
+use super::device_run::DeviceRun;
+use super::float::float_tensor;
+use super::kv_cache::{CacheHome, KvCache, RowPick};
+use super::text_generation::{GenerationSettings, GraphIo, TextGenerationPipeline, TokenScratch};
 use super::{PipelineOutput, PreparedData};
 
 /// One request for [`TextGenerationPipeline::join`].
@@ -192,6 +201,8 @@ pub struct GenerationBatch {
     /// Positions in the cache. Every row has one more token to feed.
     columns: usize,
     scratch: TokenScratch,
+    /// float16 logits of one row, widened.
+    widened: Vec<f32>,
     observer: Option<LogitsObserver>,
 }
 
@@ -231,11 +242,11 @@ impl GenerationBatch {
 
     /// Keep the cache rows in `keep`; `self.rows` already holds exactly
     /// those rows, in that order.
-    fn keep_cache_rows(&mut self, keep: &[RowPick]) -> Result<(), CoreError> {
+    fn keep_cache_rows(&mut self, keep: &[RowPick], home: CacheHome<'_>) -> Result<(), CoreError> {
         match &self.cache {
             _ if keep.is_empty() => self.clear(),
             Some(cache) if keep.len() < cache.rows() => {
-                self.cache = Some(KvCache::gather(&[(cache, keep)])?);
+                self.cache = Some(KvCache::gather(&[(cache, keep)], home)?);
             }
             _ => {}
         }
@@ -278,25 +289,23 @@ fn int64_rows(rows: usize, columns: usize, data: &[i64]) -> Result<TensorRef<'_,
         .map_err(|e| CoreError::Inference(e.to_string()))
 }
 
-/// Pick the next token of every row from the logits of a forward pass
-/// that fed `fed` positions per row.
+/// Pick the next token of every row from the logits of a forward pass.
+///
+/// `logits` is a host tensor of shape `(rows, fed, vocab)`, `float32` or
+/// `float16`: all `fed` positions the pass was given, or (`fed` = 1) only
+/// the last one, as a bound run returns it. Tokens are picked from
+/// `float32` values either way.
 ///
 /// The outer error is a pass whose logits cannot be read at all; an inner
 /// one is a row for which no token can be chosen.
 fn next_tokens(
-    outputs: &SessionOutputs<'_>,
+    logits: &DynValue,
     rows: &[Row],
     fed: usize,
     settings: &GenerationSettings,
-    scratch: &mut TokenScratch,
-    observer: &mut Option<LogitsObserver>,
+    batch: &mut BatchScratch<'_>,
 ) -> Result<Vec<Result<i64, CoreError>>, CoreError> {
-    let logits = outputs
-        .get("logits")
-        .ok_or_else(|| CoreError::Inference("graph did not return output 'logits'".to_string()))?;
-    let (shape, data) = logits
-        .try_extract_tensor::<f32>()
-        .map_err(|e| CoreError::Inference(e.to_string()))?;
+    let (shape, data) = float_tensor(logits)?;
     let dims: Vec<usize> = shape
         .iter()
         .map(|&dim| usize::try_from(dim).unwrap_or(0))
@@ -323,13 +332,99 @@ fn next_tokens(
         .map(|(index, row)| {
             // Logits of the last position predict the next token.
             let from = (index * fed + fed - 1) * vocab_size;
-            let next_logits = &data[from..from + vocab_size];
-            if let Some(observer) = observer {
+            let next_logits = data.widen(from..from + vocab_size, batch.widened);
+            if let Some(observer) = batch.observer {
                 observer(row.id, next_logits);
             }
-            settings.next_token(next_logits, &row.tokens, scratch)
+            settings.next_token(next_logits, &row.tokens, batch.scratch)
         })
         .collect())
+}
+
+/// The buffers of a [`GenerationBatch`] that picking tokens needs.
+struct BatchScratch<'a> {
+    scratch: &'a mut TokenScratch,
+    widened: &'a mut Vec<f32>,
+    observer: &'a mut Option<LogitsObserver>,
+}
+
+/// What one forward pass feeds.
+struct Feeds<'a> {
+    /// The cache of the positions already read.
+    cache: &'a KvCache,
+    /// Positions the cache will cover after the pass.
+    columns: usize,
+    rows: usize,
+    /// Positions fed per row.
+    fed: usize,
+    input_ids: &'a [i64],
+    /// `rows` x (cached + fed) values.
+    attention_mask: &'a [i64],
+    /// `rows` x `fed` values; fed only if the graph takes them.
+    position_ids: &'a [i64],
+}
+
+/// One forward pass over `feeds`, through `Session::run` or, with the
+/// cache on the device, through `device`.
+///
+/// Returns each row's next token and the cache the pass produced.
+fn forward(
+    session: &mut Session,
+    device: Option<&mut DeviceRun>,
+    io: &GraphIo,
+    feeds: &Feeds<'_>,
+    rows: &[Row],
+    settings: &GenerationSettings,
+    scratch: &mut BatchScratch<'_>,
+) -> Result<(Vec<Result<i64, CoreError>>, KvCache), CoreError> {
+    let Feeds {
+        cache,
+        columns,
+        rows: count,
+        fed,
+        input_ids,
+        attention_mask,
+        position_ids,
+    } = *feeds;
+    let input_ids = int64_rows(count, fed, input_ids)?;
+    let attention_mask = int64_rows(count, attention_mask.len() / count.max(1), attention_mask)?;
+    let position_ids = int64_rows(count, fed, position_ids)?;
+
+    if let Some(device) = device {
+        device.begin();
+        device.feed("input_ids", &*input_ids)?;
+        device.feed("attention_mask", &*attention_mask)?;
+        if io.feeds_position_ids {
+            device.feed("position_ids", &*position_ids)?;
+        }
+        for (slot, value) in io.past.iter().zip(cache.tensors()) {
+            device.feed(slot.input.as_str(), value)?;
+        }
+        let (last, present) = device.run(session, &io.past)?;
+        let tokens = next_tokens(&last, rows, 1, settings, scratch)?;
+        return Ok((tokens, KvCache::from_tensors(present, count, columns)));
+    }
+
+    let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
+        Vec::with_capacity(3 + io.past.len());
+    inputs.push((Cow::Borrowed("input_ids"), input_ids.into()));
+    inputs.push((Cow::Borrowed("attention_mask"), attention_mask.into()));
+    if io.feeds_position_ids {
+        inputs.push((Cow::Borrowed("position_ids"), position_ids.into()));
+    }
+    for (slot, value) in io.past.iter().zip(cache.tensors()) {
+        inputs.push((Cow::Borrowed(slot.input.as_str()), value.into()));
+    }
+
+    let mut outputs = session
+        .run(inputs)
+        .map_err(|e| CoreError::Inference(format!("text generation run failed: {e}")))?;
+    let logits = outputs
+        .get("logits")
+        .ok_or_else(|| CoreError::Inference("graph did not return output 'logits'".to_string()))?;
+    let tokens = next_tokens(logits, rows, fed, settings, scratch)?;
+    let cache = KvCache::from_outputs(&mut outputs, &io.past, count, columns)?;
+    Ok((tokens, cache))
 }
 
 impl TextGenerationPipeline {
@@ -496,9 +591,10 @@ impl TextGenerationPipeline {
             Ok(prefilled)
         } else {
             let running: Vec<RowPick> = (0..batch.len()).map(RowPick::copy).collect();
+            let home = self.cache_home();
             match &batch.cache {
-                Some(cache) => KvCache::gather(&[(cache, &running), (&prefilled, &picks)]),
-                None => KvCache::gather(&[(&prefilled, &picks)]),
+                Some(cache) => KvCache::gather(&[(cache, &running), (&prefilled, &picks)], home),
+                None => KvCache::gather(&[(&prefilled, &picks)], home),
             }
         };
         match cache {
@@ -540,7 +636,7 @@ impl TextGenerationPipeline {
                 Err(error) => finished.push(row.fail(error)),
             }
         }
-        if let Err(error) = batch.keep_cache_rows(&keep) {
+        if let Err(error) = batch.keep_cache_rows(&keep, self.cache_home()) {
             batch.fail_all(&error, &mut finished);
         }
         if batch.is_empty() {
@@ -576,10 +672,18 @@ impl TextGenerationPipeline {
                 }
             }
         }
-        if let Err(error) = batch.keep_cache_rows(&keep) {
+        if let Err(error) = batch.keep_cache_rows(&keep, self.cache_home()) {
             batch.fail_all(&error, &mut finished);
         }
         BatchProgress { finished, rows }
+    }
+
+    /// Where this pipeline's cache tensors live.
+    fn cache_home(&mut self) -> CacheHome<'_> {
+        match self.device.as_mut() {
+            Some(device) => CacheHome::Device(device),
+            None => CacheHome::Host(self.io.cache_type),
+        }
     }
 
     /// Run a batch of requests through a [`GenerationBatch`], up to the
@@ -672,6 +776,7 @@ impl TextGenerationPipeline {
             session,
             io,
             settings,
+            device,
             ..
         } = self;
         let rows = entrants.len();
@@ -689,40 +794,29 @@ impl TextGenerationPipeline {
             position_ids.extend(std::iter::repeat_n(0_i64, row.padding));
             position_ids.extend((0_i64..).take(row.prompt_len));
         }
-        let empty = KvCache::empty(&io.past, rows)?;
-
-        let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
-            Vec::with_capacity(3 + io.past.len());
-        inputs.push((
-            Cow::Borrowed("input_ids"),
-            int64_rows(rows, columns, &input_ids)?.into(),
-        ));
-        inputs.push((
-            Cow::Borrowed("attention_mask"),
-            int64_rows(rows, columns, &attention_mask)?.into(),
-        ));
-        if io.feeds_position_ids {
-            inputs.push((
-                Cow::Borrowed("position_ids"),
-                int64_rows(rows, columns, &position_ids)?.into(),
-            ));
-        }
-        for (slot, value) in io.past.iter().zip(empty.tensors()) {
-            inputs.push((Cow::Borrowed(slot.input.as_str()), value.into()));
-        }
-
-        let mut outputs = session
-            .run(inputs)
-            .map_err(|e| CoreError::Inference(format!("text generation run failed: {e}")))?;
-        let tokens = next_tokens(
-            &outputs,
-            entrants,
+        let empty = KvCache::empty(&io.past, rows, io.cache_type)?;
+        let feeds = Feeds {
+            cache: &empty,
             columns,
+            rows,
+            fed: columns,
+            input_ids: &input_ids,
+            attention_mask: &attention_mask,
+            position_ids: &position_ids,
+        };
+        let (tokens, cache) = forward(
+            session,
+            device.as_mut(),
+            io,
+            &feeds,
+            entrants,
             settings,
-            &mut batch.scratch,
-            &mut batch.observer,
+            &mut BatchScratch {
+                scratch: &mut batch.scratch,
+                widened: &mut batch.widened,
+                observer: &mut batch.observer,
+            },
         )?;
-        let cache = KvCache::from_outputs(&mut outputs, &io.past, rows, columns)?;
         Ok((cache, tokens))
     }
 
@@ -737,6 +831,7 @@ impl TextGenerationPipeline {
             session,
             io,
             settings,
+            device,
             ..
         } = self;
         let rows = batch.rows.len();
@@ -757,43 +852,29 @@ impl TextGenerationPipeline {
             CoreError::Inference("generation batch has rows but no cache".to_string())
         })?;
 
-        let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
-            Vec::with_capacity(3 + io.past.len());
-        inputs.push((
-            Cow::Borrowed("input_ids"),
-            int64_rows(rows, 1, &input_ids)?.into(),
-        ));
-        inputs.push((
-            Cow::Borrowed("attention_mask"),
-            int64_rows(rows, columns, &attention_mask)?.into(),
-        ));
-        if io.feeds_position_ids {
-            inputs.push((
-                Cow::Borrowed("position_ids"),
-                int64_rows(rows, 1, &position_ids)?.into(),
-            ));
-        }
-        for (slot, value) in io.past.iter().zip(cache.tensors()) {
-            inputs.push((Cow::Borrowed(slot.input.as_str()), value.into()));
-        }
-
-        let mut outputs = session
-            .run(inputs)
-            .map_err(|e| CoreError::Inference(format!("text generation run failed: {e}")))?;
-        let tokens = next_tokens(
-            &outputs,
-            &batch.rows,
-            1,
-            settings,
-            &mut batch.scratch,
-            &mut batch.observer,
-        )?;
-        batch.cache = Some(KvCache::from_outputs(
-            &mut outputs,
-            &io.past,
-            rows,
+        let feeds = Feeds {
+            cache: &cache,
             columns,
-        )?);
+            rows,
+            fed: 1,
+            input_ids: &input_ids,
+            attention_mask: &attention_mask,
+            position_ids: &position_ids,
+        };
+        let (tokens, present) = forward(
+            session,
+            device.as_mut(),
+            io,
+            &feeds,
+            &batch.rows,
+            settings,
+            &mut BatchScratch {
+                scratch: &mut batch.scratch,
+                widened: &mut batch.widened,
+                observer: &mut batch.observer,
+            },
+        )?;
+        batch.cache = Some(present);
         batch.columns = columns;
         Ok(tokens)
     }

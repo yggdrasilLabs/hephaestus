@@ -27,7 +27,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ort::session::{Session, SessionInputValue};
-use ort::value::{DynValue, Tensor, TensorElementType};
+use ort::value::{DynValue, TensorElementType};
 use tokenizers::Tokenizer;
 
 use crate::ep::ExecutionProvider;
@@ -35,10 +35,12 @@ use crate::error::CoreError;
 
 use super::chat_template::ChatTemplate;
 use super::control::{GenerationControl, TokenUsage, tokens_per_second};
+use super::device_run::{ComputeDevice, DeviceRun};
 use super::encoder_decoder::{
     TensorSpec, argmax_excluding, extend_with_repeating_tokens, int64_tensor, parse_token_id,
     read_json, spec_names,
 };
+use super::float::{FloatType, float_tensor};
 use super::{
     Execution, Pipeline, PipelineOutput, PreparedData, PreparedInput, build_onnx_session,
     resolve_onnx_path,
@@ -109,6 +111,7 @@ pub struct TextGenerationOptions {
     kv_cache: Option<bool>,
     graph_file: Option<String>,
     max_batch: Option<usize>,
+    device_cache: Option<bool>,
 }
 
 impl TextGenerationOptions {
@@ -177,6 +180,23 @@ impl TextGenerationOptions {
         self
     }
 
+    /// Keep the key/value cache on the device the session computes on
+    /// (`true`), or in host memory (`false`).
+    ///
+    /// Unset, it stays on the device with the CUDA provider and in host
+    /// memory with every other one. On the device, a forward pass runs
+    /// through an I/O binding: cache tensors are fed back where they are
+    /// and only the next-token logits come to the host (see
+    /// `device_run.rs`). In host memory, every pass returns all outputs
+    /// to the host, which on a GPU copies the whole cache out and back in
+    /// at every step. Both generate the same tokens. With the CPU
+    /// provider the "device" is host memory; `true` there is for testing
+    /// the bound path. Needs the key/value cache.
+    pub fn with_device_cache(mut self, enabled: bool) -> Self {
+        self.device_cache = Some(enabled);
+        self
+    }
+
     /// Switch the key/value cache on or off.
     ///
     /// Unset, the cache is used whenever the graph has one. `false` forces
@@ -225,6 +245,10 @@ pub(super) struct GraphIo {
     pub(super) feeds_position_ids: bool,
     /// Key/value cache slots; empty for a graph exported without a cache.
     pub(super) past: Vec<PastSlot>,
+    /// Float type of every cache tensor (`float32` without a cache).
+    pub(super) cache_type: FloatType,
+    /// Float type of the logits.
+    pub(super) logits_type: FloatType,
 }
 
 impl GraphIo {
@@ -238,7 +262,9 @@ impl GraphIo {
     /// Returns [`CoreError::ModelValidation`] if the graph has no
     /// `input_ids` input or no `logits` output, declares an input this
     /// pipeline cannot feed, has a cache input without a matching output,
-    /// or uses element types other than int64 tokens and float32 tensors.
+    /// uses element types other than int64 tokens and float32 or float16
+    /// cache tensors and logits, or mixes the two float types within its
+    /// cache. The logits may be of the other float type than the cache.
     fn from_specs(
         inputs: &[TensorSpec],
         outputs: &[TensorSpec],
@@ -254,10 +280,22 @@ impl GraphIo {
             )))
         };
 
+        let float = |spec: &TensorSpec| {
+            FloatType::of(spec.element_type).ok_or_else(|| {
+                CoreError::ModelValidation(format!(
+                    "tensor '{}' has element type {:?}, but text generation needs Float32 or \
+                     Float16",
+                    spec.name, spec.element_type,
+                ))
+            })
+        };
+
         let mut has_input_ids = false;
         let mut feeds_attention_mask = false;
         let mut feeds_position_ids = false;
         let mut past = Vec::new();
+        // The float type of the cache, and the tensor that set it.
+        let mut cache_type: Option<(FloatType, &str)> = None;
         for spec in inputs {
             match spec.name.as_str() {
                 "input_ids" => {
@@ -280,7 +318,6 @@ impl GraphIo {
                             spec_names(inputs),
                         )));
                     };
-                    require(spec, TensorElementType::Float32)?;
                     let output = format!("{PRESENT_OUTPUT_PREFIX}{slot}");
                     let present = outputs
                         .iter()
@@ -290,7 +327,19 @@ impl GraphIo {
                                 "graph has cache input '{name}' but no output '{output}' to feed it",
                             ))
                         })?;
-                    require(present, TensorElementType::Float32)?;
+                    for tensor in [spec, present] {
+                        let found = float(tensor)?;
+                        let (expected, set_by) =
+                            *cache_type.get_or_insert((found, tensor.name.as_str()));
+                        if found != expected {
+                            return Err(CoreError::ModelValidation(format!(
+                                "cache tensor '{}' is {found:?} but '{set_by}' is {expected:?}; \
+                                 text generation needs one float type for the whole key/value \
+                                 cache",
+                                tensor.name,
+                            )));
+                        }
+                    }
                     past.push(PastSlot {
                         input: spec.name.clone(),
                         output,
@@ -315,12 +364,14 @@ impl GraphIo {
                     spec_names(outputs),
                 ))
             })?;
-        require(logits, TensorElementType::Float32)?;
+        let logits_type = float(logits)?;
 
         Ok(Self {
             feeds_attention_mask,
             feeds_position_ids,
             past,
+            cache_type: cache_type.map_or(FloatType::F32, |(float, _)| float),
+            logits_type,
         })
     }
 }
@@ -608,6 +659,39 @@ fn resolve_max_batch(
     Ok(requested)
 }
 
+/// Decide whether the cache stays on the session's device, and which
+/// device that is.
+///
+/// Unset, it does with the CUDA provider, where host memory is a copy
+/// away, and does not with any other. `None` keeps it in host memory.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] if it was asked for explicitly and the
+/// provider or the graph cannot do it.
+fn resolve_device_cache(
+    requested: Option<bool>,
+    ep: &ExecutionProvider,
+    kv_cache: bool,
+) -> Result<Option<ComputeDevice>, CoreError> {
+    let device = ComputeDevice::of(ep);
+    match requested {
+        Some(false) => Ok(None),
+        Some(true) if !kv_cache => Err(CoreError::Config(
+            "text generation cannot keep a key/value cache on the device without a key/value \
+             cache"
+                .to_string(),
+        )),
+        Some(true) => device.map(Some).ok_or_else(|| {
+            CoreError::Config(format!(
+                "text generation cannot keep its key/value cache on the device of execution \
+                 provider '{ep}'; only cpu and cuda are supported",
+            ))
+        }),
+        None => Ok(device.filter(|_| kv_cache && *ep == ExecutionProvider::Cuda)),
+    }
+}
+
 /// Apply the Hugging Face repetition penalty to next-token logits.
 ///
 /// Every token already in the sequence -- prompt included -- has its logit
@@ -701,9 +785,12 @@ pub struct TextGenerationPipeline {
     /// Whether generation keeps a key/value cache between steps.
     kv_cache: bool,
     /// Empty cache tensors fed before anything is cached, one per slot.
-    empty_past: Vec<Tensor<f32>>,
+    empty_past: Vec<DynValue>,
     /// Generations that may share a forward pass; 1 runs them one by one.
     pub(super) max_batch: usize,
+    /// Present when the cache stays on the session's device: forward
+    /// passes then run through it instead of `Session::run`.
+    pub(super) device: Option<DeviceRun>,
 }
 
 impl TextGenerationPipeline {
@@ -768,7 +855,7 @@ impl TextGenerationPipeline {
             .past
             .iter()
             .map(|slot| {
-                Tensor::<f32>::from_array((slot.empty_dims, Vec::<f32>::new())).map_err(|e| {
+                io.cache_type.zeros(&slot.empty_dims).map_err(|e| {
                     CoreError::ModelLoad(format!(
                         "cannot create an empty tensor for cache input '{}': {e}",
                         slot.input,
@@ -776,6 +863,9 @@ impl TextGenerationPipeline {
                 })
             })
             .collect::<Result<Vec<_>, CoreError>>()?;
+        let device = resolve_device_cache(options.device_cache, ep, kv_cache)?
+            .map(|device| DeviceRun::new(&session, ep, device, io.cache_type, io.logits_type))
+            .transpose()?;
 
         let pipeline = Self {
             session,
@@ -791,16 +881,39 @@ impl TextGenerationPipeline {
             kv_cache,
             empty_past,
             max_batch,
+            device,
         };
 
         // 4. The template must render what requests will send; a model
         //    that refuses a system message fails here, not on a request.
-        pipeline.prepare_prompt(TextGenerationInput::from("Hello".to_string()))?;
+        let probe = pipeline.prepare_prompt(TextGenerationInput::from("Hello".to_string()))?;
+
+        // 5. A cache that is meant to stay on a device must really be
+        //    there: one forward pass shows where the session puts it. A
+        //    session that is not computing on the device fails here.
+        let mut pipeline = pipeline;
+        if pipeline.device.is_some() {
+            pipeline
+                .generate(&probe, &GenerationControl::default(), 1, &mut |_| {})
+                .map_err(|e| {
+                    CoreError::ModelLoad(format!(
+                        "text generation cannot keep its key/value cache on the device of \
+                         execution provider '{ep}' (set TEXT_GENERATION_DEVICE_CACHE=off to \
+                         keep it in host memory): {e}"
+                    ))
+                })?;
+        }
 
         tracing::info!(
             model = %model_path.display(),
             kv_cache = pipeline.kv_cache,
             cache_tensors = pipeline.io.past.len(),
+            cache_type = ?pipeline.io.cache_type,
+            logits_type = ?pipeline.io.logits_type,
+            cache_device = %pipeline
+                .device
+                .as_ref()
+                .map_or_else(|| "host".to_string(), |device| device.device().name()),
             position_ids = pipeline.io.feeds_position_ids,
             max_input_tokens,
             max_new_tokens = pipeline.settings.max_new_tokens,
@@ -829,6 +942,12 @@ impl TextGenerationPipeline {
     /// Whether generation keeps a key/value cache between steps.
     pub fn uses_kv_cache(&self) -> bool {
         self.kv_cache
+    }
+
+    /// Whether the key/value cache stays on the session's device between
+    /// steps; see [`TextGenerationOptions::with_device_cache`].
+    pub fn keeps_cache_on_device(&self) -> bool {
+        self.device.is_some()
     }
 
     /// Run one short generation so the first request does not pay for
@@ -973,6 +1092,7 @@ impl TextGenerationPipeline {
             settings,
             kv_cache,
             empty_past,
+            device,
             ..
         } = self;
         let kv_cache = *kv_cache;
@@ -987,6 +1107,8 @@ impl TextGenerationPipeline {
         let mut cache: Vec<DynValue> = Vec::new();
         let mut cached_len = 0_usize;
         let mut scratch = TokenScratch::default();
+        // float16 logits of the last position, widened.
+        let mut widened: Vec<f32> = Vec::new();
         let mut first_step = None;
 
         for step in 0..max_new_tokens {
@@ -996,77 +1118,119 @@ impl TextGenerationPipeline {
             let fed_from = if kv_cache { cached_len } else { 0 };
             let fed = &tokens[fed_from..];
 
-            let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
-                Vec::with_capacity(3 + io.past.len());
-            inputs.push((
-                Cow::Borrowed("input_ids"),
-                int64_tensor(fed.len(), fed)?.into(),
-            ));
-            if io.feeds_attention_mask {
-                inputs.push((
-                    Cow::Borrowed("attention_mask"),
-                    int64_tensor(tokens.len(), &ones[..tokens.len()])?.into(),
-                ));
-            }
-            if io.feeds_position_ids {
-                inputs.push((
-                    Cow::Borrowed("position_ids"),
-                    int64_tensor(fed.len(), &positions[fed_from..tokens.len()])?.into(),
-                ));
-            }
-            for (index, slot) in io.past.iter().enumerate() {
-                let value: SessionInputValue<'_> = if fed_from > 0 {
-                    (&cache[index]).into()
-                } else {
-                    (&empty_past[index]).into()
-                };
-                inputs.push((Cow::Borrowed(slot.input.as_str()), value));
-            }
+            let mask = &ones[..tokens.len()];
+            let fed_positions = &positions[fed_from..tokens.len()];
 
-            let mut outputs = session
-                .run(inputs)
-                .map_err(|e| CoreError::Inference(format!("text generation run failed: {e}")))?;
-            let logits = outputs.get("logits").ok_or_else(|| {
-                CoreError::Inference("graph did not return output 'logits'".to_string())
-            })?;
-            let (shape, data) = logits
-                .try_extract_tensor::<f32>()
-                .map_err(|e| CoreError::Inference(e.to_string()))?;
-            let vocab_size = match shape.iter().copied().collect::<Vec<i64>>().as_slice() {
-                [1, _, vocab] => usize::try_from(*vocab).ok().filter(|&size| size > 0),
-                _ => None,
-            }
-            .ok_or_else(|| {
-                CoreError::Inference(format!(
-                    "expected logits of shape (1, seq, vocab), got {shape:?}",
-                ))
-            })?;
-            // Logits of the last position predict the next token.
-            let last_position = data.len().checked_sub(vocab_size).ok_or_else(|| {
-                CoreError::Inference(format!(
-                    "logits hold {} values, fewer than the vocabulary size {vocab_size}",
-                    data.len(),
-                ))
-            })?;
-            let next_logits = &data[last_position..];
-            observe(next_logits);
-
-            let token = settings.next_token(next_logits, &tokens, &mut scratch)?;
-
-            if kv_cache {
-                cache.clear();
-                for slot in &io.past {
-                    let value = outputs.remove(slot.output.as_str()).ok_or_else(|| {
-                        CoreError::Inference(format!(
-                            "graph did not return output '{}'",
-                            slot.output
-                        ))
-                    })?;
-                    cache.push(value);
+            let token = if let Some(device) = device.as_mut() {
+                // The cache stays on the device; only the logits of the
+                // last position come back.
+                device.begin();
+                device.feed("input_ids", &*int64_tensor(fed.len(), fed)?)?;
+                if io.feeds_attention_mask {
+                    device.feed("attention_mask", &*int64_tensor(mask.len(), mask)?)?;
                 }
+                if io.feeds_position_ids {
+                    device.feed(
+                        "position_ids",
+                        &*int64_tensor(fed_positions.len(), fed_positions)?,
+                    )?;
+                }
+                for (index, slot) in io.past.iter().enumerate() {
+                    let past = if fed_from > 0 {
+                        &cache[index]
+                    } else {
+                        &empty_past[index]
+                    };
+                    device.feed(slot.input.as_str(), past)?;
+                }
+                let (last, present) = device.run(session, &io.past)?;
+                let (shape, data) = last
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| CoreError::Inference(e.to_string()))?;
+                let dims: Vec<i64> = shape.iter().copied().collect();
+                if !matches!(dims.as_slice(), [1, 1, vocab] if *vocab > 0) {
+                    return Err(CoreError::Inference(format!(
+                        "expected next-token logits of shape (1, 1, vocab), got {shape:?}",
+                    )));
+                }
+                observe(data);
+                let token = settings.next_token(data, &tokens, &mut scratch)?;
+                cache = present;
                 cached_len = tokens.len();
-            }
-            drop(outputs);
+                token
+            } else {
+                let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
+                    Vec::with_capacity(3 + io.past.len());
+                inputs.push((
+                    Cow::Borrowed("input_ids"),
+                    int64_tensor(fed.len(), fed)?.into(),
+                ));
+                if io.feeds_attention_mask {
+                    inputs.push((
+                        Cow::Borrowed("attention_mask"),
+                        int64_tensor(mask.len(), mask)?.into(),
+                    ));
+                }
+                if io.feeds_position_ids {
+                    inputs.push((
+                        Cow::Borrowed("position_ids"),
+                        int64_tensor(fed_positions.len(), fed_positions)?.into(),
+                    ));
+                }
+                for (index, slot) in io.past.iter().enumerate() {
+                    let value: SessionInputValue<'_> = if fed_from > 0 {
+                        (&cache[index]).into()
+                    } else {
+                        (&empty_past[index]).into()
+                    };
+                    inputs.push((Cow::Borrowed(slot.input.as_str()), value));
+                }
+
+                let mut outputs = session.run(inputs).map_err(|e| {
+                    CoreError::Inference(format!("text generation run failed: {e}"))
+                })?;
+                let logits = outputs.get("logits").ok_or_else(|| {
+                    CoreError::Inference("graph did not return output 'logits'".to_string())
+                })?;
+                let (shape, data) = float_tensor(logits)?;
+                let vocab_size = match shape.as_slice() {
+                    [1, _, vocab] => usize::try_from(*vocab).ok().filter(|&size| size > 0),
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    CoreError::Inference(format!(
+                        "expected logits of shape (1, seq, vocab), got {shape:?}",
+                    ))
+                })?;
+                // Logits of the last position predict the next token.
+                let last_position = data.len().checked_sub(vocab_size).ok_or_else(|| {
+                    CoreError::Inference(format!(
+                        "logits hold {} values, fewer than the vocabulary size {vocab_size}",
+                        data.len(),
+                    ))
+                })?;
+                let next_logits = data.widen(last_position..data.len(), &mut widened);
+                observe(next_logits);
+
+                let token = settings.next_token(next_logits, &tokens, &mut scratch)?;
+
+                if kv_cache {
+                    let mut present = Vec::with_capacity(io.past.len());
+                    for slot in &io.past {
+                        let value = outputs.remove(slot.output.as_str()).ok_or_else(|| {
+                            CoreError::Inference(format!(
+                                "graph did not return output '{}'",
+                                slot.output
+                            ))
+                        })?;
+                        present.push(value);
+                    }
+                    drop(outputs);
+                    cache = present;
+                    cached_len = tokens.len();
+                }
+                token
+            };
             first_step.get_or_insert_with(|| started.elapsed());
 
             tokens.push(token);
@@ -1184,6 +1348,69 @@ mod tests {
     }
 
     #[test]
+    fn float_types_of_cache_and_logits_are_read_from_the_graph() {
+        // Arrange -- the cache and the logits each in either float type.
+        let (inputs, outputs) = optimum_specs();
+        let retyped = |specs: &[TensorSpec], cache: TensorElementType, logits| -> Vec<TensorSpec> {
+            specs
+                .iter()
+                .cloned()
+                .map(|mut spec| {
+                    if spec.name == "logits" {
+                        spec.element_type = Some(logits);
+                    } else if spec.element_type == Some(TensorElementType::Float32) {
+                        spec.element_type = Some(cache);
+                    }
+                    spec
+                })
+                .collect()
+        };
+        let types = [
+            (TensorElementType::Float32, FloatType::F32),
+            (TensorElementType::Float16, FloatType::F16),
+        ];
+
+        for (cache_element, cache_type) in types {
+            for (logits_element, logits_type) in types {
+                // Act
+                let io = GraphIo::from_specs(
+                    &retyped(&inputs, cache_element, logits_element),
+                    &retyped(&outputs, cache_element, logits_element),
+                    &json!({}),
+                )
+                .expect("wiring");
+
+                // Assert -- the two are independent of each other.
+                assert_eq!(io.cache_type, cache_type);
+                assert_eq!(io.logits_type, logits_type);
+                assert_eq!(io.past.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn cache_stays_on_the_device_only_where_asked_or_with_cuda() {
+        let cpu = ExecutionProvider::Cpu;
+        let cuda = ExecutionProvider::Cuda;
+        let resolve = |requested, ep: &ExecutionProvider, kv_cache| {
+            resolve_device_cache(requested, ep, kv_cache).map(|device| device.is_some())
+        };
+
+        // Unset: only CUDA, and only with a cache to keep.
+        assert!(!resolve(None, &cpu, true).unwrap());
+        assert!(resolve(None, &cuda, true).unwrap());
+        assert!(!resolve(None, &cuda, false).unwrap());
+        assert!(!resolve(None, &ExecutionProvider::TensorRt, true).unwrap());
+        // Asked for: wherever it can be done, else an error.
+        assert!(resolve(Some(true), &cpu, true).unwrap());
+        assert!(!resolve(Some(false), &cuda, true).unwrap());
+        for (ep, kv_cache) in [(&cpu, false), (&ExecutionProvider::CoreMl, true)] {
+            let err = resolve(Some(true), ep, kv_cache).unwrap_err();
+            assert!(matches!(err, CoreError::Config(_)), "{err:?}");
+        }
+    }
+
+    #[test]
     fn graph_without_cache_or_position_ids_is_accepted() {
         // Arrange -- a plain `text-generation` export of a GPT-2 style model.
         let inputs = vec![int64("input_ids"), int64("attention_mask")];
@@ -1204,6 +1431,11 @@ mod tests {
             inputs.push(extra);
             inputs
         };
+        let with_output = |extra: TensorSpec| {
+            let mut outputs = outputs.clone();
+            outputs.push(extra);
+            outputs
+        };
         let cases: Vec<(&str, Vec<TensorSpec>, Vec<TensorSpec>, &str)> = vec![
             (
                 "legacy merged decoder",
@@ -1218,10 +1450,52 @@ mod tests {
                 "inputs_embeds",
             ),
             (
-                "half-precision cache",
-                with_input(spec("past_key_values.1.key", TensorElementType::Float16, &[-1, 3, -1, 64])),
-                outputs.clone(),
-                "Float16",
+                "cache of two float types",
+                with_input(spec(
+                    "past_key_values.1.key",
+                    TensorElementType::Float16,
+                    &[-1, 3, -1, 64],
+                )),
+                with_output(spec(
+                    "present.1.key",
+                    TensorElementType::Float16,
+                    &[-1, 3, -1, 64],
+                )),
+                "one float type",
+            ),
+            (
+                "cache input and output of different float types",
+                with_input(cache("past_key_values.1.key")),
+                with_output(spec(
+                    "present.1.key",
+                    TensorElementType::Float16,
+                    &[-1, 3, -1, 64],
+                )),
+                "one float type",
+            ),
+            (
+                "double-precision cache",
+                with_input(spec(
+                    "past_key_values.1.key",
+                    TensorElementType::Float64,
+                    &[-1, 3, -1, 64],
+                )),
+                with_output(spec(
+                    "present.1.key",
+                    TensorElementType::Float64,
+                    &[-1, 3, -1, 64],
+                )),
+                "Float32 or Float16",
+            ),
+            (
+                "integer logits",
+                inputs.clone(),
+                vec![
+                    spec("logits", TensorElementType::Int64, &[-1, -1, 49152]),
+                    cache("present.0.key"),
+                    cache("present.0.value"),
+                ],
+                "Float32 or Float16",
             ),
             (
                 "cache input without output",
