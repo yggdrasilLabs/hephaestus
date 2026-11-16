@@ -73,7 +73,9 @@ RUN apt-get update \
 COPY --from=builder /out/app/ /opt/hephaestus/
 COPY --from=builder --chown=65534:65534 /out/cache /cache
 
-ENV LD_LIBRARY_PATH=/opt/hephaestus
+# The NVIDIA container runtime and GKE mount the driver libraries
+# (libcuda.so.1) under /usr/local/nvidia; keep that on the path.
+ENV LD_LIBRARY_PATH=/opt/hephaestus:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV HOME=/cache
 ENV PORT=8080
