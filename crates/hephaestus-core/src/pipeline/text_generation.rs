@@ -13,6 +13,11 @@
 //! only the newest token; without one every step re-reads everything.
 //! Both loops pick the same tokens.
 //!
+//! With a batch width above one ([`TextGenerationOptions::with_max_batch`])
+//! several requests share each forward pass; that loop is in
+//! `generation_batch.rs` and picks, for every request, the tokens the loop
+//! here picks for it alone.
+//!
 //! As in encoder-decoder mode, everything a specific model could get wrong
 //! is checked when the pipeline is constructed, so a misfit fails at
 //! startup with a message naming the problem.
@@ -45,6 +50,9 @@ pub const TEXT_GENERATION_MIN_INPUT_TOKENS: usize = 16;
 /// Absolute ceiling on generated tokens per request, whatever the model or
 /// the operator asks for.
 pub const TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT: usize = 4096;
+
+/// Largest accepted batch width: generations that may share a forward pass.
+pub const TEXT_GENERATION_MAX_BATCH_LIMIT: usize = 64;
 
 /// Input token cap when [`TextGenerationOptions`] does not set one. Counts
 /// the whole prompt: template, system message and user message.
@@ -100,6 +108,7 @@ pub struct TextGenerationOptions {
     system_prompt: Option<String>,
     kv_cache: Option<bool>,
     graph_file: Option<String>,
+    max_batch: Option<usize>,
 }
 
 impl TextGenerationOptions {
@@ -156,6 +165,18 @@ impl TextGenerationOptions {
         self
     }
 
+    /// Let up to `width` generations share each forward pass.
+    ///
+    /// Unset or `1`, every request is generated alone, one after another.
+    /// Above one, requests are decoded together and each still gets the
+    /// tokens it would get alone (see `generation_batch.rs` for what that
+    /// rests on). Needs a graph with a key/value cache and an
+    /// `attention_mask` input; without them the width stays one.
+    pub fn with_max_batch(mut self, width: usize) -> Self {
+        self.max_batch = Some(width);
+        self
+    }
+
     /// Switch the key/value cache on or off.
     ///
     /// Unset, the cache is used whenever the graph has one. `false` forces
@@ -185,25 +206,25 @@ impl From<String> for TextGenerationInput {
 
 /// One key/value cache input and the output that feeds it next step.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PastSlot {
+pub(super) struct PastSlot {
     /// Input name (`past_key_values.<layer>.<key|value>`).
-    input: String,
+    pub(super) input: String,
     /// Output name (`present.<layer>.<key|value>`).
-    output: String,
+    pub(super) output: String,
     /// Shape of the tensor fed before anything is cached:
     /// `(1, heads, 0, head_dim)`.
-    empty_dims: [usize; 4],
+    pub(super) empty_dims: [usize; 4],
 }
 
 /// How to feed the graph and where to read its results.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct GraphIo {
+pub(super) struct GraphIo {
     /// Whether the graph declares an `attention_mask` input.
-    feeds_attention_mask: bool,
+    pub(super) feeds_attention_mask: bool,
     /// Whether the graph declares a `position_ids` input.
-    feeds_position_ids: bool,
+    pub(super) feeds_position_ids: bool,
     /// Key/value cache slots; empty for a graph exported without a cache.
-    past: Vec<PastSlot>,
+    pub(super) past: Vec<PastSlot>,
 }
 
 impl GraphIo {
@@ -353,15 +374,22 @@ fn empty_cache_dims(spec: &TensorSpec, config: &serde_json::Value) -> Result<[us
 /// Each value is taken from `generation_config.json` when that file
 /// declares it and from `config.json` otherwise.
 #[derive(Debug, Clone, PartialEq)]
-struct GenerationSettings {
+pub(super) struct GenerationSettings {
     /// Tokens that end generation. Empty when the model declares none.
-    eos_token_ids: Vec<i64>,
+    pub(super) eos_token_ids: Vec<i64>,
     /// Hard upper bound on generated tokens.
-    max_new_tokens: usize,
+    pub(super) max_new_tokens: usize,
     /// Penalty on tokens already in the sequence; 1.0 disables it.
     repetition_penalty: f32,
     /// No sequence of this many tokens may occur twice; 0 disables the rule.
     no_repeat_ngram_size: usize,
+}
+
+/// Buffers [`GenerationSettings::next_token`] reuses between steps.
+#[derive(Default)]
+pub(super) struct TokenScratch {
+    banned: Vec<i64>,
+    penalized: Vec<f32>,
 }
 
 impl GenerationSettings {
@@ -468,6 +496,38 @@ impl GenerationSettings {
     }
 }
 
+impl GenerationSettings {
+    /// The token greedy decoding appends to `tokens` given the next-token
+    /// logits: the most likely one after the repetition penalty and the
+    /// repeated n-gram rule. The one rule for every decode loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Inference`] if no token can be chosen (empty
+    /// or all-NaN logits) or the index does not fit a token ID.
+    pub(super) fn next_token(
+        &self,
+        next_logits: &[f32],
+        tokens: &[i64],
+        scratch: &mut TokenScratch,
+    ) -> Result<i64, CoreError> {
+        let TokenScratch { banned, penalized } = scratch;
+        banned.clear();
+        extend_with_repeating_tokens(banned, tokens, self.no_repeat_ngram_size);
+        let token = if self.repetition_penalty == 1.0 {
+            argmax_excluding(next_logits, banned)?
+        } else {
+            penalized.clear();
+            penalized.extend_from_slice(next_logits);
+            penalize_repeats(penalized, tokens, self.repetition_penalty);
+            argmax_excluding(penalized, banned)?
+        };
+        i64::try_from(token).map_err(|_| {
+            CoreError::Inference(format!("token index {token} does not fit a token ID"))
+        })
+    }
+}
+
 /// Resolve the prompt token cap for a model.
 ///
 /// The prompt and the generated tokens share the model's context
@@ -513,6 +573,41 @@ fn resolve_max_input_tokens(
     }
 }
 
+/// Resolve the batch width for a graph.
+///
+/// Batching needs the key/value cache and an `attention_mask` input to
+/// hide the padding of shorter prompts; a graph without them keeps
+/// generating one request at a time, with a warning.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] if the requested width is zero or above
+/// [`TEXT_GENERATION_MAX_BATCH_LIMIT`].
+fn resolve_max_batch(
+    requested: Option<usize>,
+    kv_cache: bool,
+    feeds_attention_mask: bool,
+) -> Result<usize, CoreError> {
+    let limit = TEXT_GENERATION_MAX_BATCH_LIMIT;
+    let requested = requested.unwrap_or(1);
+    if requested == 0 || requested > limit {
+        return Err(CoreError::Config(format!(
+            "text generation max batch must be between 1 and {limit} (got {requested})",
+        )));
+    }
+    if requested > 1 && !(kv_cache && feeds_attention_mask) {
+        tracing::warn!(
+            requested,
+            kv_cache,
+            attention_mask = feeds_attention_mask,
+            "text generation cannot batch without a key/value cache and an attention_mask input; \
+             generating one request at a time"
+        );
+        return Ok(1);
+    }
+    Ok(requested)
+}
+
 /// Apply the Hugging Face repetition penalty to next-token logits.
 ///
 /// Every token already in the sequence -- prompt included -- has its logit
@@ -538,10 +633,10 @@ fn penalize_repeats(logits: &mut [f32], tokens: &[i64], penalty: f32) {
 /// running; a clone prepares exactly what the pipeline would.
 #[derive(Clone)]
 pub(super) struct PromptBuilder {
-    tokenizer: Tokenizer,
+    pub(super) tokenizer: Tokenizer,
     template: ChatTemplate,
     /// Cap on prompt tokens.
-    max_input_tokens: usize,
+    pub(super) max_input_tokens: usize,
     /// System message of requests that bring none.
     system_prompt: Option<String>,
 }
@@ -596,17 +691,19 @@ impl PromptBuilder {
 /// - a chat template: `chat_template.jinja`, or `chat_template` in
 ///   `tokenizer_config.json`
 pub struct TextGenerationPipeline {
-    session: Session,
+    pub(super) session: Session,
     /// Turns requests into prompts; also decodes the generated tokens.
-    prompt: PromptBuilder,
-    io: GraphIo,
-    settings: GenerationSettings,
+    pub(super) prompt: PromptBuilder,
+    pub(super) io: GraphIo,
+    pub(super) settings: GenerationSettings,
     /// Time budget for one request.
     timeout: Option<Duration>,
     /// Whether generation keeps a key/value cache between steps.
     kv_cache: bool,
     /// Empty cache tensors fed before anything is cached, one per slot.
     empty_past: Vec<Tensor<f32>>,
+    /// Generations that may share a forward pass; 1 runs them one by one.
+    pub(super) max_batch: usize,
 }
 
 impl TextGenerationPipeline {
@@ -666,6 +763,7 @@ impl TextGenerationPipeline {
             &config,
         )?;
         let kv_cache = options.kv_cache.unwrap_or(true) && !io.past.is_empty();
+        let max_batch = resolve_max_batch(options.max_batch, kv_cache, io.feeds_attention_mask)?;
         let empty_past = io
             .past
             .iter()
@@ -692,6 +790,7 @@ impl TextGenerationPipeline {
             timeout: options.timeout,
             kv_cache,
             empty_past,
+            max_batch,
         };
 
         // 4. The template must render what requests will send; a model
@@ -709,6 +808,7 @@ impl TextGenerationPipeline {
             repetition_penalty = pipeline.settings.repetition_penalty,
             no_repeat_ngram_size = pipeline.settings.no_repeat_ngram_size,
             default_system_prompt = pipeline.prompt.system_prompt.is_some(),
+            max_batch = pipeline.max_batch,
             "text generation pipeline loaded (greedy decoding)"
         );
         if pipeline.settings.eos_token_ids.is_empty() {
@@ -744,13 +844,27 @@ impl TextGenerationPipeline {
             .map(|_| ())
     }
 
+    /// Run generation for a batch: one request after another when the
+    /// batch width is one, else up to that many together (see
+    /// `generation_batch.rs`). Either way every request gets the same
+    /// tokens.
+    pub(super) fn execute_batch(
+        &mut self,
+        batch: Vec<PreparedData>,
+        controls: &[GenerationControl],
+    ) -> Vec<Result<Execution, CoreError>> {
+        if self.max_batch > 1 {
+            self.execute_batch_together(batch, controls)
+        } else {
+            self.execute_batch_sequential(batch, controls)
+        }
+    }
+
     /// Run generation for a batch, one request after another.
     ///
-    /// Generation is token by token, so requests cannot share one padded
-    /// forward pass the way the single-pass profiles do. Returns one
-    /// result per request, in order. The time budget covers the batch;
-    /// `controls[i]`, when present, limits request `i` further.
-    pub(super) fn execute_batch_sequential(
+    /// Returns one result per request, in order. The time budget covers
+    /// the batch; `controls[i]`, when present, limits request `i` further.
+    fn execute_batch_sequential(
         &mut self,
         batch: Vec<PreparedData>,
         controls: &[GenerationControl],
@@ -791,7 +905,7 @@ impl TextGenerationPipeline {
         self.generate_text(&prepared, &control)
     }
 
-    fn deadline_from_now(&self) -> Option<Instant> {
+    pub(super) fn deadline_from_now(&self) -> Option<Instant> {
         self.timeout.map(|timeout| Instant::now() + timeout)
     }
 
@@ -839,7 +953,7 @@ impl TextGenerationPipeline {
     /// [`CoreError::Cancelled`] or [`CoreError::Timeout`] if `control`
     /// stops the loop between two steps, and [`CoreError::Inference`] if
     /// the graph fails or returns a tensor of an unexpected shape.
-    fn generate(
+    pub(super) fn generate(
         &mut self,
         prepared: &PreparedInput,
         control: &GenerationControl,
@@ -872,8 +986,7 @@ impl TextGenerationPipeline {
         // Cache tensors in slot order, and the tokens they cover.
         let mut cache: Vec<DynValue> = Vec::new();
         let mut cached_len = 0_usize;
-        let mut banned = Vec::new();
-        let mut penalized = Vec::new();
+        let mut scratch = TokenScratch::default();
         let mut first_step = None;
 
         for step in 0..max_new_tokens {
@@ -938,19 +1051,7 @@ impl TextGenerationPipeline {
             let next_logits = &data[last_position..];
             observe(next_logits);
 
-            banned.clear();
-            extend_with_repeating_tokens(&mut banned, &tokens, settings.no_repeat_ngram_size);
-            let token = if settings.repetition_penalty == 1.0 {
-                argmax_excluding(next_logits, &banned)?
-            } else {
-                penalized.clear();
-                penalized.extend_from_slice(next_logits);
-                penalize_repeats(&mut penalized, &tokens, settings.repetition_penalty);
-                argmax_excluding(&penalized, &banned)?
-            };
-            let token = i64::try_from(token).map_err(|_| {
-                CoreError::Inference(format!("token index {token} does not fit a token ID"))
-            })?;
+            let token = settings.next_token(next_logits, &tokens, &mut scratch)?;
 
             if kv_cache {
                 cache.clear();

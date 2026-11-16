@@ -6,6 +6,8 @@ mod classifier;
 mod control;
 mod embeddings;
 mod encoder_decoder;
+mod generation_batch;
+mod kv_cache;
 mod preparer;
 mod seq2seq;
 mod text_generation;
@@ -17,10 +19,14 @@ pub use control::{Execution, GenerationControl, TokenUsage};
 pub use embeddings::EmbeddingsPipeline;
 pub use preparer::Preparer;
 pub use encoder_decoder::{SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS};
+pub use generation_batch::{
+    BatchProgress, FinishedGeneration, GenerationBatch, GenerationRequest,
+};
 pub use seq2seq::{Seq2SeqOptions, Seq2SeqPipeline};
 pub use text_generation::{
-    TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT, TEXT_GENERATION_MIN_INPUT_TOKENS, TextGenerationInput,
-    TextGenerationOptions, TextGenerationPipeline,
+    TEXT_GENERATION_MAX_BATCH_LIMIT, TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT,
+    TEXT_GENERATION_MIN_INPUT_TOKENS, TextGenerationInput, TextGenerationOptions,
+    TextGenerationPipeline,
 };
 pub use token_classifier::TokenClassifierPipeline;
 
@@ -132,6 +138,15 @@ impl PreparedData {
     pub fn into_text(self) -> Option<PreparedInput> {
         match self {
             Self::Text(t) => Some(t),
+            Self::Audio(_) => None,
+        }
+    }
+
+    /// Tokens of a prepared text input (for text generation: the whole
+    /// prompt). `None` for audio.
+    pub fn token_count(&self) -> Option<usize> {
+        match self {
+            Self::Text(t) => Some(t.sequence_length),
             Self::Audio(_) => None,
         }
     }
@@ -491,6 +506,20 @@ impl PipelineKind {
         matches!(self, Self::TextGeneration(_))
     }
 
+    /// How many generations of this pipeline may share a forward pass.
+    ///
+    /// Above one only for a text generation pipeline built with
+    /// [`TextGenerationOptions::with_max_batch`] on a graph that can
+    /// batch; a caller then drives a [`GenerationBatch`] with
+    /// [`TextGenerationPipeline::join`] and
+    /// [`TextGenerationPipeline::step`].
+    pub fn generation_batch_width(&self) -> usize {
+        match self {
+            Self::TextGeneration(p) => p.max_batch(),
+            _ => 1,
+        }
+    }
+
     /// Prepare input for any profile (D-01).
     ///
     /// Accepts `String` (backward compat via `From<String>`) or
@@ -580,9 +609,10 @@ impl PipelineKind {
         {
             return p.execute_batch_sequential(batch, controls);
         }
-        // Text generation is token by token as well.
+        // Text generation is token by token as well; with a batch width
+        // above one its requests share forward passes.
         if let Self::TextGeneration(p) = self {
-            return p.execute_batch_sequential(batch, controls);
+            return p.execute_batch(batch, controls);
         }
         self.execute_batch_single_pass(batch)
             .into_iter()

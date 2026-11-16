@@ -29,7 +29,9 @@ pub use pipeline::{
     SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS,
 };
 pub use pipeline::{
-    TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT, TEXT_GENERATION_MIN_INPUT_TOKENS, TextGenerationInput,
-    TextGenerationOptions, TextGenerationPipeline,
+    BatchProgress, FinishedGeneration, GenerationBatch, GenerationRequest,
+    TEXT_GENERATION_MAX_BATCH_LIMIT, TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT,
+    TEXT_GENERATION_MIN_INPUT_TOKENS, TextGenerationInput, TextGenerationOptions,
+    TextGenerationPipeline,
 };
 pub use profile::{ModelProfile, detect_profile};

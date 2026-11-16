@@ -35,6 +35,40 @@ and the logits at position ``t`` are ``8 - |v - target_t|`` for token
     The same function without a cache, as a plain ``text-generation``
     export: inputs ``input_ids`` and ``attention_mask``, output ``logits``.
 
+``model_batch.onnx``
+    A graph for batched generation, shaped like the exports that have no
+    ``position_ids`` input (Qwen3 from onnx-community): inputs
+    ``input_ids``, ``attention_mask`` and ``past_key_values.0.{key,value}``.
+    Rows of a batch are independent, and the graph honours the attention
+    mask the way a transformer with relative (rotary) positions does:
+
+    * the position of a token is its *column*: ``past + 0, past + 1, ...``,
+      whatever the mask says, as in a graph that derives positions from
+      the tensor shapes;
+    * the key tensor caches the token IDs and the value tensor the
+      positions they were read at;
+    * the token at column ``i`` sees column ``j`` when ``j <= i`` and
+      ``attention_mask[j] == 1``, and
+
+          total_i = sum over seen j of (id_j + 1) * (pos_i - pos_j + 1)
+
+      takes the place of ``sum_t`` above. ``pos_i`` is this step's column
+      and ``pos_j`` comes from the cache.
+
+    So a row gives the same tokens as it does alone exactly when its real
+    tokens sit in consecutive columns that end at the newest column (left
+    padding), padded columns are masked, real ones are not, and the cache
+    of a row is never moved to other columns than it was computed at. A
+    padded column that is not masked adds at least ``pos_i - pos_j + 1``;
+    a masked real column removes its term; a gap or a shift between cached
+    and new columns changes the distances.
+
+``model_batch_positions.onnx``
+    The same with a ``position_ids`` input: positions are what the caller
+    feeds, and ``total_i`` also adds ``pos_i`` itself, so feeding a padded
+    row its column numbers instead of its own positions changes the
+    output.
+
 ``tokenizer_config.json``
     A chat template made of words the tokenizer knows: a system message is
     wrapped as ``a ... b``, a user message as ``c ... d``, and the reply
@@ -185,6 +219,103 @@ def make_cached() -> None:
     _save(graph, "model.onnx")
 
 
+def make_batched(name: str, position_ids: bool) -> None:
+    """A cached graph whose batch rows are independent and masked per row."""
+    nodes = [
+        # Columns: the cache covers 0..past, this step past..total.
+        helper.make_node("Shape", ["past_key_values.0.key"], ["past_shape"]),
+        helper.make_node("Gather", ["past_shape", "two"], ["past"], axis=0),
+        helper.make_node("Shape", ["input_ids"], ["ids_shape"]),
+        helper.make_node("Gather", ["ids_shape", "one"], ["seq"], axis=0),
+        helper.make_node("Add", ["past", "seq"], ["total"]),
+        helper.make_node("Range", ["past", "total", "one"], ["query_columns"]),
+        helper.make_node("Range", ["zero", "total", "one"], ["columns"]),
+    ]
+    if position_ids:
+        nodes.append(helper.make_node("Identity", ["position_ids"], ["query_positions"]))
+    else:
+        # (seq,) broadcast to (batch, seq).
+        nodes += [
+            helper.make_node("Mul", ["input_ids", "zero"], ["ids_zero"]),
+            helper.make_node("Add", ["ids_zero", "query_columns"], ["query_positions"]),
+        ]
+    nodes += [
+        # This step's cache entries: token IDs (key) and positions (value).
+        helper.make_node("Cast", ["input_ids"], ["ids_f"], to=TensorProto.FLOAT),
+        helper.make_node("Unsqueeze", ["ids_f", "axes13"], ["ids_4d"]),
+        helper.make_node("Mul", ["ids_4d", "cache_ones"], ["new_key"]),
+        helper.make_node("Cast", ["query_positions"], ["pos_f"], to=TensorProto.FLOAT),
+        helper.make_node("Unsqueeze", ["pos_f", "axes13"], ["pos_4d"]),
+        helper.make_node("Mul", ["pos_4d", "cache_ones"], ["new_value"]),
+        helper.make_node("Concat", ["past_key_values.0.key", "new_key"], ["present.0.key"], axis=2),
+        helper.make_node("Concat", ["past_key_values.0.value", "new_value"], ["present.0.value"], axis=2),
+        # Every token and position in the cache: (batch, total).
+        helper.make_node("Gather", ["present.0.key", "zero"], ["key_h"], axis=1),
+        helper.make_node("Gather", ["key_h", "zero"], ["history_f"], axis=2),
+        helper.make_node("Cast", ["history_f"], ["history"], to=TensorProto.INT64),
+        helper.make_node("Gather", ["present.0.value", "zero"], ["value_h"], axis=1),
+        helper.make_node("Gather", ["value_h", "zero"], ["positions_f"], axis=2),
+        helper.make_node("Cast", ["positions_f"], ["positions"], to=TensorProto.INT64),
+        # (id_j + 1) * (pos_i - pos_j + 1): (batch, seq, total).
+        helper.make_node("Unsqueeze", ["query_positions", "axis2"], ["query_3d"]),
+        helper.make_node("Unsqueeze", ["positions", "axis1"], ["positions_3d"]),
+        helper.make_node("Sub", ["query_3d", "positions_3d"], ["distance_ij"]),
+        helper.make_node("Add", ["distance_ij", "one"], ["weight"]),
+        helper.make_node("Add", ["history", "one"], ["history_1"]),
+        helper.make_node("Unsqueeze", ["history_1", "axis1"], ["history_3d"]),
+        helper.make_node("Mul", ["history_3d", "weight"], ["term"]),
+        # Seen: at or before the query's column, and not masked.
+        helper.make_node("Unsqueeze", ["query_columns", "axis1"], ["query_columns_2d"]),
+        helper.make_node("LessOrEqual", ["columns", "query_columns_2d"], ["causal_b"]),
+        helper.make_node("Cast", ["causal_b"], ["causal"], to=TensorProto.INT64),
+        helper.make_node("Unsqueeze", ["attention_mask", "axis1"], ["mask_3d"]),
+        helper.make_node("Mul", ["mask_3d", "causal"], ["seen"]),
+        helper.make_node("Mul", ["term", "seen"], ["seen_term"]),
+        helper.make_node("ReduceSum", ["seen_term", "axis2"], ["attended"], keepdims=0),
+    ]
+    if position_ids:
+        nodes.append(helper.make_node("Add", ["attended", "query_positions"], ["checked"]))
+    else:
+        nodes.append(helper.make_node("Identity", ["attended"], ["checked"]))
+    nodes += _logits_nodes("checked")
+
+    cache_shape = ["batch", HEADS, "past_sequence_length", HEAD_DIM]
+    present_shape = ["batch", HEADS, "past_sequence_length + sequence_length", HEAD_DIM]
+    inputs = [
+        helper.make_tensor_value_info("input_ids", TensorProto.INT64, ["batch", "sequence_length"]),
+        helper.make_tensor_value_info(
+            "attention_mask", TensorProto.INT64, ["batch", "past_sequence_length + sequence_length"]
+        ),
+    ]
+    if position_ids:
+        inputs.append(
+            helper.make_tensor_value_info("position_ids", TensorProto.INT64, ["batch", "sequence_length"])
+        )
+    inputs += [
+        helper.make_tensor_value_info("past_key_values.0.key", TensorProto.FLOAT, cache_shape),
+        helper.make_tensor_value_info("past_key_values.0.value", TensorProto.FLOAT, cache_shape),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "text_generation_batched",
+        inputs,
+        [
+            helper.make_tensor_value_info("logits", TensorProto.FLOAT, ["batch", "sequence_length", VOCAB_SIZE]),
+            helper.make_tensor_value_info("present.0.key", TensorProto.FLOAT, present_shape),
+            helper.make_tensor_value_info("present.0.value", TensorProto.FLOAT, present_shape),
+        ],
+        initializer=[
+            *_logits_initializers(),
+            _scalar("one", 1),
+            _scalar("two", 2),
+            _int("axis1", [1]),
+            _int("axes13", [1, 3]),
+            helper.make_tensor("cache_ones", TensorProto.FLOAT, [1, HEADS, 1, HEAD_DIM], [1.0] * (HEADS * HEAD_DIM)),
+        ],
+    )
+    _save(graph, name)
+
+
 def make_uncached() -> None:
     nodes = [
         helper.make_node("CumSum", ["input_ids", "one"], ["sums"]),
@@ -217,4 +348,6 @@ def make_tokenizer_config() -> None:
 if __name__ == "__main__":
     make_cached()
     make_uncached()
+    make_batched("model_batch.onnx", position_ids=False)
+    make_batched("model_batch_positions.onnx", position_ids=True)
     make_tokenizer_config()
