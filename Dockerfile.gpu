@@ -5,9 +5,17 @@
 #
 # linux/amd64 only: the ONNX Runtime binaries the `ort` crate downloads have a
 # CUDA build for x86_64 Linux and none for aarch64 (an arm64 GPU image needs
-# ONNX Runtime compiled from source). That build is for CUDA 13, so the
-# runtime stage is a CUDA 13 + cuDNN image. Run with EXECUTION_PROVIDER=cuda
-# and an `nvidia.com/gpu` resource; with `cpu` it behaves like the CPU image.
+# ONNX Runtime compiled from source). That build is for CUDA 13 and cuDNN 9,
+# so the runtime stage is a CUDA 13 + cuDNN 9 image. Run with
+# EXECUTION_PROVIDER=cuda and an `nvidia.com/gpu` resource; with `cpu` it
+# behaves like the CPU image.
+#
+# The runtime base is CUDA 13.0, not the newest 13.x: the image declares the
+# CUDA version it needs from the host driver (NVIDIA_REQUIRE_CUDA, here
+# `cuda>=13.0`), and the NVIDIA container runtime refuses to start a container
+# whose requirement the driver does not meet. The R580 driver branch is the
+# CUDA 13.0 branch; a 13.5 base declares `cuda>=13.5`, which that driver
+# does not meet.
 
 # ---------- builder ----------
 FROM ubuntu:24.04 AS builder
@@ -56,7 +64,7 @@ RUN mkdir -p /out/app /out/cache \
     && chown 65534:65534 /out/cache
 
 # ---------- runtime ----------
-FROM nvidia/cuda:13.5.0-cudnn-runtime-ubuntu24.04
+FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3t64 \
