@@ -70,21 +70,22 @@ impl InferenceService for GrpcInferenceService {
                     .ok_or(ApiError::Internal("batcher not available".into()))?
                     .submit(prepared, Some(deadline))
                     .await?;
-                Ok::<_, ApiError>(pipeline_output.to_json())
+                Ok::<_, ApiError>((pipeline_output.to_json(), pipeline_output.usage))
             } else {
                 // Direct path: a place in the inference queue first (refused
                 // at once when it is full), then prepare.
                 let ticket = self.state.admit(Some(deadline))?;
                 let prepared = timer.time("tokenization", || self.state.prepare(req.text))?;
                 // The model runs on the inference worker thread, so this
-                // task only waits.
+                // task only waits. tonic drops this future when the client
+                // cancels the call, which stops a running generation.
                 let pipeline_output = ticket.run(prepared, Some(timer.clone())).await?;
-                Ok::<_, ApiError>(pipeline_output.to_json())
+                Ok::<_, ApiError>((pipeline_output.to_json(), pipeline_output.usage))
             }
         })
         .await;
 
-        let mut output = match result {
+        let (mut output, usage) = match result {
             Ok(inner) => match inner {
                 Ok(output) => {
                     timer.finish_request(request_start, true);
@@ -133,6 +134,8 @@ impl InferenceService for GrpcInferenceService {
         tracing::info!(
             model_id = %self.state.model_id(),
             latency_ms,
+            prompt_tokens = usage.map(|usage| usage.prompt_tokens),
+            completion_tokens = usage.map(|usage| usage.completion_tokens),
             status = "success",
             "gRPC inference request completed"
         );

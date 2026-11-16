@@ -22,9 +22,10 @@ pub(crate) mod postprocess;
 pub use ep::ExecutionProvider;
 pub use error::CoreError;
 pub use pipeline::{
-    AsrPipeline, ClassifierOutput, ClassifierPipeline, EmbeddingsPipeline, Entity,
-    InferenceInput, Pipeline, PipelineKind, PipelineOutput, PreparedAudio,
+    AsrPipeline, ClassifierOutput, ClassifierPipeline, EmbeddingsPipeline, Entity, Execution,
+    GenerationControl, InferenceInput, Pipeline, PipelineKind, PipelineOutput, PreparedAudio,
     PreparedData, PreparedInput, Preparer, Seq2SeqOptions, Seq2SeqPipeline, TokenClassifierPipeline,
+    TokenUsage,
     SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS,
 };
 pub use pipeline::{

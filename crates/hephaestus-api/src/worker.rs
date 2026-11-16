@@ -11,20 +11,28 @@
 //! every request whose caller has stopped waiting or whose deadline has
 //! passed, so work nobody will read is never started.
 //!
+//! Every request carries a [`CancelFlag`], set when the future waiting for
+//! its result is dropped (request timeout, client disconnect). The token
+//! loops of the generating pipelines read the flag, and the deadline,
+//! between steps through a
+//! [`GenerationControl`](hephaestus_core::GenerationControl), so a
+//! generation nobody waits for stops within one token.
+//!
 //! The worker, not the handler, owns a job from the moment it is queued:
-//! the prepared input, the deadline and the reply channel all travel in
-//! the [`Job`]. A later change that runs several generations in one loop
-//! can therefore take more jobs off the queue between token steps (a
-//! non-blocking variant of [`Shared::next_job`]) and answer each one as it
-//! finishes, without touching the handlers.
+//! the prepared input, the deadline, the cancel flag and the reply channel
+//! all travel in the [`Job`]. A later change that runs several generations
+//! in one loop can therefore take more jobs off the queue between token
+//! steps (a non-blocking variant of [`Shared::next_job`]), give each
+//! sequence the control built by [`Shared::control`], and answer each one
+//! as it finishes, without touching the handlers.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use hephaestus_core::{PipelineKind, PipelineOutput, PreparedData};
+use hephaestus_core::{CoreError, Execution, GenerationControl, PipelineKind, PreparedData};
 use tokio::sync::{RwLock, oneshot};
 
 use crate::batcher::BatchRequest;
@@ -39,7 +47,58 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 pub const QUEUE_FULL_RETRY_AFTER_SECS: u64 = 1;
 
 /// Reply channel of one request.
-type Reply = oneshot::Sender<Result<PipelineOutput, ApiError>>;
+type Reply = oneshot::Sender<Result<Execution, ApiError>>;
+
+/// Tells the worker that nobody is waiting for a request any more.
+///
+/// Cloning shares the flag. Once set it stays set.
+#[derive(Debug, Clone, Default)]
+pub struct CancelFlag(Arc<AtomicBool>);
+
+impl CancelFlag {
+    /// A flag that is not set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the flag: the request is not run if it is still queued, and
+    /// its generation stops before the next token if it is running.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the flag is set.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Sets a [`CancelFlag`] when dropped, unless disarmed first.
+///
+/// Held across the wait for a result: if the waiting future is dropped
+/// (request timeout, client gone), the request is cancelled.
+pub(crate) struct CancelOnDrop {
+    flag: Option<CancelFlag>,
+}
+
+impl CancelOnDrop {
+    pub(crate) fn new(flag: CancelFlag) -> Self {
+        Self { flag: Some(flag) }
+    }
+
+    /// The result arrived: there is nothing left to cancel.
+    pub(crate) fn disarm(mut self) {
+        self.flag = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(flag) = &self.flag {
+            flag.cancel();
+        }
+    }
+}
 
 /// One request's place among the waiting requests.
 ///
@@ -73,25 +132,36 @@ struct Request {
     prepared: PreparedData,
     /// When the caller stops waiting; `None` for callers without a timeout.
     deadline: Option<Instant>,
+    /// Set when the caller has stopped waiting.
+    cancel: CancelFlag,
     reply: Reply,
     slot: Slot,
+}
+
+/// A request the worker is about to run.
+struct Started {
+    prepared: PreparedData,
+    control: GenerationControl,
+    reply: Reply,
 }
 
 impl Request {
     /// Take the request off the waiting list as the worker reaches it.
     ///
-    /// Returns the input and reply channel of a request that should run,
-    /// and `None` for one whose caller is gone or whose deadline has
-    /// passed; the latter is answered with [`ApiError::Timeout`].
-    fn start(self, now: Instant) -> Option<(PreparedData, Reply)> {
+    /// Returns the input, limits and reply channel of a request that
+    /// should run, and `None` for one whose caller is gone or whose
+    /// deadline has passed; the latter is answered with
+    /// [`ApiError::Timeout`].
+    fn start(self, now: Instant) -> Option<Started> {
         let Self {
             prepared,
             deadline,
+            cancel,
             reply,
             slot,
         } = self;
         let shared = Arc::clone(&slot.shared);
-        if reply.is_closed() {
+        if cancel.is_cancelled() || reply.is_closed() {
             shared.count_dropped("abandoned");
             return None;
         }
@@ -101,7 +171,11 @@ impl Request {
             return None;
         }
         slot.started();
-        Some((prepared, reply))
+        Some(Started {
+            prepared,
+            control: shared.control(deadline, cancel),
+            reply,
+        })
     }
 }
 
@@ -144,6 +218,10 @@ struct Shared {
     /// run. Lets a test stand in for a slow model.
     #[cfg(test)]
     before_inference: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test seam: runs on the worker thread before each token step of a
+    /// generation. Lets a test slow the loop down and count its steps.
+    #[cfg(test)]
+    on_generation_step: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Shared {
@@ -261,6 +339,63 @@ impl Shared {
         }
     }
 
+    /// The limits of one request's generation: its deadline and its
+    /// cancel flag, asked before every token step.
+    fn control(&self, deadline: Option<Instant>, cancel: CancelFlag) -> GenerationControl {
+        #[cfg(test)]
+        let on_step = self
+            .on_generation_step
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let control = GenerationControl::new().with_cancel_check(move || {
+            #[cfg(test)]
+            if let Some(on_step) = &on_step {
+                on_step();
+            }
+            cancel.is_cancelled()
+        });
+        match deadline {
+            Some(deadline) => control.with_deadline(deadline),
+            None => control,
+        }
+    }
+
+    /// Record what a finished run generated: the token counters, and the
+    /// rate over the whole run (prompt processing included).
+    fn record_usage(&self, execution: &Execution, elapsed: Duration) {
+        let Some(usage) = execution.usage else {
+            return;
+        };
+        metrics::counter!(
+            "hephaestus_prompt_tokens_total",
+            "model_id" => self.model_id.clone(),
+        )
+        .increment(usage.prompt_tokens as u64);
+        metrics::counter!(
+            "hephaestus_generated_tokens_total",
+            "model_id" => self.model_id.clone(),
+        )
+        .increment(usage.completion_tokens as u64);
+        let seconds = elapsed.as_secs_f64();
+        if seconds > 0.0 {
+            metrics::histogram!(
+                "hephaestus_generation_tokens_per_second",
+                "model_id" => self.model_id.clone(),
+            )
+            .record(usage.completion_tokens as f64 / seconds);
+        }
+    }
+
+    /// Count a generation that was stopped because its caller went away.
+    fn count_cancelled(&self) {
+        metrics::counter!(
+            "hephaestus_inference_jobs_cancelled_total",
+            "model_id" => self.model_id.clone(),
+        )
+        .increment(1);
+    }
+
     /// Run the test seam, if one is installed.
     fn before_inference(&self) {
         #[cfg(test)]
@@ -293,16 +428,20 @@ impl Shared {
     }
 }
 
-/// Removes a queued job when the future waiting for it is dropped (request
-/// timeout, client gone), so a dead job does not hold a place in the queue.
+/// Gives a job up when the future waiting for it is dropped (request
+/// timeout, client gone): sets its cancel flag, which stops a running
+/// generation, and removes it from the queue if it is still there, so a
+/// dead job does not hold a place.
 struct AbandonOnDrop<'a> {
     shared: &'a Shared,
+    cancel: CancelFlag,
     id: Option<u64>,
 }
 
 impl Drop for AbandonOnDrop<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.id {
+            self.cancel.cancel();
             self.shared.abandon(id);
         }
     }
@@ -320,8 +459,9 @@ impl InferenceTicket {
     /// Queue `prepared` and wait for the worker to run it.
     ///
     /// `timer` records the duration of the model run as the `inference`
-    /// stage. If the returned future is dropped while the job is still
-    /// queued, the job is removed and never runs.
+    /// stage. If the returned future is dropped (request timeout, client
+    /// disconnect), a job that is still queued is removed and never runs,
+    /// and a generation that is running stops before its next token.
     ///
     /// # Errors
     ///
@@ -333,19 +473,22 @@ impl InferenceTicket {
         self,
         prepared: PreparedData,
         timer: Option<StageTimer>,
-    ) -> Result<PipelineOutput, ApiError> {
+    ) -> Result<Execution, ApiError> {
         let Self { slot, deadline } = self;
         let shared = Arc::clone(&slot.shared);
+        let cancel = CancelFlag::new();
         let (reply, result) = oneshot::channel();
         let request = Request {
             prepared,
             deadline,
+            cancel: cancel.clone(),
             reply,
             slot,
         };
         let (id, _finished) = shared.push(vec![request], false, timer)?;
         let mut abandon = AbandonOnDrop {
             shared: &shared,
+            cancel,
             id: Some(id),
         };
         let result = result.await;
@@ -385,6 +528,8 @@ impl InferenceWorker {
             wake: Condvar::new(),
             #[cfg(test)]
             before_inference: Mutex::new(None),
+            #[cfg(test)]
+            on_generation_step: Mutex::new(None),
         });
         let thread_shared = Arc::clone(&shared);
         std::thread::Builder::new()
@@ -396,7 +541,9 @@ impl InferenceWorker {
 
     /// Set how many requests may wait at one time (at least one).
     pub(crate) fn set_capacity(&self, capacity: usize) {
-        self.shared.capacity.store(capacity.max(1), Ordering::SeqCst);
+        self.shared
+            .capacity
+            .store(capacity.max(1), Ordering::SeqCst);
     }
 
     /// Install the test seam that runs before every job's model run.
@@ -405,6 +552,16 @@ impl InferenceWorker {
         *self
             .shared
             .before_inference
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(hook));
+    }
+
+    /// Install the test seam that runs before every token step.
+    #[cfg(test)]
+    pub(crate) fn set_on_generation_step(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .shared
+            .on_generation_step
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(hook));
     }
@@ -445,6 +602,7 @@ impl InferenceWorker {
                 Some(Request {
                     prepared: request.prepared,
                     deadline: request.deadline,
+                    cancel: request.cancel,
                     reply: request.reply,
                     slot: self.shared.take_slot(false)?,
                 })
@@ -491,11 +649,11 @@ fn run_job(shared: &Shared, pipeline: &RwLock<PipelineKind>, job: Job) {
         ..
     } = job;
     let now = Instant::now();
-    let (inputs, replies): (Vec<PreparedData>, Vec<Reply>) = requests
+    let started: Vec<Started> = requests
         .into_iter()
         .filter_map(|request| request.start(now))
-        .unzip();
-    if inputs.is_empty() {
+        .collect();
+    if started.is_empty() {
         return;
     }
 
@@ -506,17 +664,46 @@ fn run_job(shared: &Shared, pipeline: &RwLock<PipelineKind>, job: Job) {
     shared.before_inference();
 
     if batched {
-        let results = pipeline.execute_batch(inputs);
+        let mut inputs = Vec::with_capacity(started.len());
+        let mut controls = Vec::with_capacity(started.len());
+        let mut replies = Vec::with_capacity(started.len());
+        for request in started {
+            inputs.push(request.prepared);
+            controls.push(request.control);
+            replies.push(request.reply);
+        }
+        let run_started = Instant::now();
+        let results = pipeline.execute_batch_with(inputs, &controls);
+        let elapsed = run_started.elapsed();
+        // The requests of a generating batch ran one after another, so
+        // the batch's time is shared out evenly for the token rate.
+        let share = elapsed / u32::try_from(results.len().max(1)).unwrap_or(u32::MAX);
         for (reply, result) in replies.into_iter().zip(results) {
-            let _ = reply.send(result.map_err(ApiError::from));
+            answer(shared, reply, result, share);
         }
     } else {
-        for (prepared, reply) in inputs.into_iter().zip(replies) {
+        for request in started {
+            let run_started = Instant::now();
             let result = match &timer {
-                Some(timer) => timer.time("inference", || pipeline.execute(prepared)),
-                None => pipeline.execute(prepared),
+                Some(timer) => timer.time("inference", || {
+                    pipeline.execute_with(request.prepared, &request.control)
+                }),
+                None => pipeline.execute_with(request.prepared, &request.control),
             };
-            let _ = reply.send(result.map_err(ApiError::from));
+            answer(shared, request.reply, result, run_started.elapsed());
         }
     }
+}
+
+/// Record the outcome of one request's run and send it to the caller.
+fn answer(shared: &Shared, reply: Reply, result: Result<Execution, CoreError>, elapsed: Duration) {
+    match &result {
+        Ok(execution) => shared.record_usage(execution, elapsed),
+        Err(CoreError::Cancelled(reason)) => {
+            shared.count_cancelled();
+            tracing::info!(reason = %reason, "generation stopped: the caller is gone");
+        }
+        Err(_) => {}
+    }
+    let _ = reply.send(result.map_err(ApiError::from));
 }

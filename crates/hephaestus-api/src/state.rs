@@ -114,6 +114,13 @@ impl AppState {
         self.worker.set_before_inference(hook);
     }
 
+    /// Install the test seam that runs on the worker thread before every
+    /// token step of a generation.
+    #[cfg(test)]
+    pub(crate) fn set_on_generation_step(&self, hook: impl Fn() + Send + Sync + 'static) {
+        self.worker.set_on_generation_step(hook);
+    }
+
     /// Requests admitted to the inference queue and not yet started.
     #[cfg(test)]
     pub(crate) fn waiting_requests(&self) -> usize {
@@ -210,8 +217,9 @@ impl AppState {
     }
 
     /// Begin shutdown of inference: refuse new jobs and fail the queued
-    /// ones with [`ApiError::NotReady`]. The job that is running finishes
-    /// (or stops at its deadline). Does not touch the readiness flag.
+    /// ones with [`ApiError::NotReady`]. The job that is running finishes,
+    /// unless its deadline passes or its caller goes away first. Does not
+    /// touch the readiness flag.
     pub fn shutdown_inference(&self) {
         self.worker.close();
     }

@@ -28,6 +28,7 @@ use tokenizers::Tokenizer;
 use crate::ep::ExecutionProvider;
 use crate::error::CoreError;
 
+use super::control::{GenerationControl, tokens_per_second};
 use super::seq2seq::Seq2SeqOptions;
 use super::{PreparedInput, build_onnx_session};
 
@@ -642,11 +643,11 @@ fn resolve_max_input_tokens(
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Timeout`] once `deadline` has passed, and any
-/// error `next_token` returns.
+/// Returns [`CoreError::Cancelled`] or [`CoreError::Timeout`] once
+/// `control` stops the loop, and any error `next_token` returns.
 fn greedy_decode<F>(
     settings: &GenerationSettings,
-    deadline: Option<Instant>,
+    control: &GenerationControl,
     mut next_token: F,
 ) -> Result<Vec<i64>, CoreError>
 where
@@ -668,7 +669,7 @@ where
         let token = match forced {
             Some(token) => token,
             None => {
-                ensure_before(deadline, tokens.len() - 1)?;
+                control.check("seq2seq generation", tokens.len() - 1)?;
                 banned.clear();
                 extend_with_repeating_tokens(&mut banned, &tokens, settings.no_repeat_ngram_size);
                 next_token(&tokens, &banned)?
@@ -703,16 +704,6 @@ pub(super) fn extend_with_repeating_tokens(banned: &mut Vec<i64>, tokens: &[i64]
             .filter(|ngram| &ngram[..prefix_len] == prefix)
             .map(|ngram| ngram[prefix_len]),
     );
-}
-
-/// Fail with [`CoreError::Timeout`] if the deadline has passed.
-fn ensure_before(deadline: Option<Instant>, generated: usize) -> Result<(), CoreError> {
-    match deadline {
-        Some(deadline) if Instant::now() >= deadline => Err(CoreError::Timeout(format!(
-            "seq2seq generation exceeded its time budget after {generated} tokens",
-        ))),
-        _ => Ok(()),
-    }
 }
 
 /// Index of the largest value among permitted tokens; the first wins a tie.
@@ -880,14 +871,14 @@ impl EncoderDecoder {
     /// # Errors
     ///
     /// Returns [`CoreError::InvalidInput`] for an empty token sequence,
-    /// [`CoreError::Timeout`] if `deadline` passes, and
-    /// [`CoreError::Inference`] if a graph fails or returns a tensor of an
-    /// unexpected shape.
+    /// [`CoreError::Cancelled`] or [`CoreError::Timeout`] if `control`
+    /// stops the generation, and [`CoreError::Inference`] if a graph fails
+    /// or returns a tensor of an unexpected shape.
     pub(super) fn generate(
         &mut self,
         encoder: &mut Session,
         prepared: &PreparedInput,
-        deadline: Option<Instant>,
+        control: &GenerationControl,
     ) -> Result<Vec<u32>, CoreError> {
         let input_len = prepared.sequence_length;
         if input_len == 0 {
@@ -895,7 +886,7 @@ impl EncoderDecoder {
                 "seq2seq input produced no tokens".to_string(),
             ));
         }
-        ensure_before(deadline, 0)?;
+        control.check("seq2seq generation", 0)?;
         let started = Instant::now();
 
         // Encoder pass.
@@ -946,7 +937,7 @@ impl EncoderDecoder {
         // number of decoder tokens they cover. Local to this input.
         let mut cache: Vec<DynValue> = Vec::new();
         let mut cached_len = 0_usize;
-        let generated = greedy_decode(settings, deadline, |tokens, banned| {
+        let generated = greedy_decode(settings, control, |tokens, banned| {
             // The cached branch takes exactly the one token the cache does
             // not cover yet. Anything else (the first step, which may hold
             // a forced token after the start token) runs the uncached
@@ -1050,12 +1041,14 @@ impl EncoderDecoder {
             })
         })?;
 
+        let elapsed = started.elapsed();
         tracing::debug!(
             input_tokens = input_len,
             generated_tokens = generated.len(),
             reached_token_limit = generated.len() == settings.max_new_tokens,
             encoder_ms = encoder_elapsed.as_secs_f64() * 1000.0,
-            decode_ms = (started.elapsed() - encoder_elapsed).as_secs_f64() * 1000.0,
+            decode_ms = (elapsed - encoder_elapsed).as_secs_f64() * 1000.0,
+            tokens_per_second = tokens_per_second(generated.len(), elapsed),
             "seq2seq generation finished"
         );
 
@@ -1901,7 +1894,7 @@ mod tests {
         let mut script = [10, 11, 2, 99].into_iter();
 
         // Act
-        let generated = greedy_decode(&settings, None, |_, _| Ok(script.next().unwrap_or(99)))
+        let generated = greedy_decode(&settings, &GenerationControl::default(), |_, _| Ok(script.next().unwrap_or(99)))
             .expect("decode should succeed");
 
         // Assert -- the end token is kept, nothing after it is requested.
@@ -1916,7 +1909,7 @@ mod tests {
         let mut calls = 0;
 
         // Act
-        let generated = greedy_decode(&settings, None, |_, _| {
+        let generated = greedy_decode(&settings, &GenerationControl::default(), |_, _| {
             calls += 1;
             Ok(7)
         })
@@ -1934,7 +1927,7 @@ mod tests {
         let mut seen: Vec<Vec<i64>> = Vec::new();
 
         // Act
-        greedy_decode(&settings, None, |tokens, _| {
+        greedy_decode(&settings, &GenerationControl::default(), |tokens, _| {
             seen.push(tokens.to_vec());
             Ok(40 + i64::try_from(tokens.len()).expect("small length"))
         })
@@ -1953,7 +1946,7 @@ mod tests {
         let mut calls = 0;
 
         // Act
-        let generated = greedy_decode(&settings, None, |_, _| {
+        let generated = greedy_decode(&settings, &GenerationControl::default(), |_, _| {
             calls += 1;
             Ok(7)
         })
@@ -1973,7 +1966,7 @@ mod tests {
 
         // Act
         let generated =
-            greedy_decode(&settings, None, |_, _| Ok(7)).expect("decode should succeed");
+            greedy_decode(&settings, &GenerationControl::default(), |_, _| Ok(7)).expect("decode should succeed");
 
         // Assert
         assert_eq!(generated, vec![2]);
@@ -1983,10 +1976,10 @@ mod tests {
     fn greedy_decode_times_out_at_deadline() {
         // Arrange -- a deadline that has already passed.
         let settings = settings(1000);
-        let deadline = Some(Instant::now());
+        let control = GenerationControl::new().with_deadline(Instant::now());
 
         // Act
-        let result = greedy_decode(&settings, deadline, |_, _| Ok(7));
+        let result = greedy_decode(&settings, &control, |_, _| Ok(7));
 
         // Assert
         assert!(matches!(result, Err(CoreError::Timeout(_))));
@@ -1998,7 +1991,7 @@ mod tests {
         let settings = settings(10);
 
         // Act
-        let result = greedy_decode(&settings, None, |_, _| {
+        let result = greedy_decode(&settings, &GenerationControl::default(), |_, _| {
             Err(CoreError::Inference("decoder run failed".to_string()))
         });
 
@@ -2072,7 +2065,7 @@ mod tests {
         settings.no_repeat_ngram_size = 3;
 
         // Act
-        let generated = greedy_decode(&settings, None, |_, banned| {
+        let generated = greedy_decode(&settings, &GenerationControl::default(), |_, banned| {
             Ok(if banned.contains(&0) { 9 } else { 0 })
         })
         .expect("decode should succeed");

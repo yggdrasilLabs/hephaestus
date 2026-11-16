@@ -13,11 +13,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hephaestus_core::{PipelineOutput, PreparedData};
+use hephaestus_core::{Execution, PreparedData};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ApiError;
 use crate::state::AppState;
+use crate::worker::{CancelFlag, CancelOnDrop};
 
 /// A single inference request queued for batching.
 pub struct BatchRequest {
@@ -26,8 +27,11 @@ pub struct BatchRequest {
     /// When the caller stops waiting. A request still waiting for the
     /// model at that moment is answered with a timeout and not run.
     pub deadline: Option<Instant>,
+    /// Set when the caller has stopped waiting: the request is left out
+    /// of its batch, or its generation is stopped.
+    pub cancel: CancelFlag,
     /// One-shot channel to send the result back to the HTTP handler.
-    pub reply: oneshot::Sender<Result<PipelineOutput, ApiError>>,
+    pub reply: oneshot::Sender<Result<Execution, ApiError>>,
 }
 
 /// Handle for submitting requests to the batcher.
@@ -60,7 +64,8 @@ impl Batcher {
     /// Creates a oneshot channel, sends the request into the batch
     /// queue, and awaits the result. Backpressure is applied when the
     /// channel is full -- the `.send().await` suspends until space is
-    /// available. `deadline` is when the caller stops waiting.
+    /// available. `deadline` is when the caller stops waiting. Dropping
+    /// the returned future cancels the request.
     ///
     /// # Errors
     ///
@@ -73,19 +78,24 @@ impl Batcher {
         &self,
         prepared: PreparedData,
         deadline: Option<Instant>,
-    ) -> Result<PipelineOutput, ApiError> {
+    ) -> Result<Execution, ApiError> {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let cancel = CancelFlag::new();
+        let cancel_on_drop = CancelOnDrop::new(cancel.clone());
 
         self.tx
             .send(BatchRequest {
                 prepared,
                 deadline,
+                cancel,
                 reply: reply_tx,
             })
             .await
             .map_err(|_| ApiError::Inference("batcher channel closed".to_string()))?;
 
-        reply_rx.await.map_err(|_| {
+        let result = reply_rx.await;
+        cancel_on_drop.disarm();
+        result.map_err(|_| {
             ApiError::Inference("batcher reply channel dropped without response".to_string())
         })?
     }
@@ -172,9 +182,12 @@ mod tests {
             .expect("channel should have a request");
 
         // Verify request arrived. Send a reply to complete the round trip.
-        let _ = req.reply.send(Ok(hephaestus_core::PipelineOutput::Classifier {
-            label: "TEST".to_string(),
-            score: 0.99,
+        let _ = req.reply.send(Ok(Execution {
+            output: hephaestus_core::PipelineOutput::Classifier {
+                label: "TEST".to_string(),
+                score: 0.99,
+            },
+            usage: None,
         }));
 
         handle.await.expect("submit task should complete");
@@ -199,6 +212,7 @@ mod tests {
             match batcher.tx.try_send(BatchRequest {
                 prepared,
                 deadline: None,
+                cancel: CancelFlag::new(),
                 reply: reply_tx,
             }) {
                 Ok(()) => sent += 1,

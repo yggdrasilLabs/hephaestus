@@ -402,7 +402,7 @@ async fn run_asr_inference(
     let prepared = state.prepare(InferenceInput::Audio(samples))?;
 
     // The ONNX session runs on the inference worker thread.
-    let output = ticket.run(prepared, None).await?;
+    let output = ticket.run(prepared, None).await?.output;
 
     match output {
         PipelineOutput::Asr(text) => Ok(text),

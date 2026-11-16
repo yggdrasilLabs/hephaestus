@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hephaestus_core::{
-    CoreError, ExecutionProvider, Pipeline, PipelineKind, PipelineOutput, PreparedAudio,
-    PreparedData, Seq2SeqOptions, Seq2SeqPipeline,
+    CoreError, ExecutionProvider, GenerationControl, Pipeline, PipelineKind, PipelineOutput,
+    PreparedAudio, PreparedData, Seq2SeqOptions, Seq2SeqPipeline, TokenUsage,
 };
 use tempfile::TempDir;
 
@@ -569,4 +569,79 @@ fn batch_shares_one_time_budget() {
             .iter()
             .all(|result| matches!(result, Err(CoreError::Timeout(_))))
     );
+}
+
+// --- Per-request limits and token counts ---
+
+#[test]
+fn cancelled_generation_stops_between_decoder_steps() {
+    // Arrange -- cancelled on the fourth time the loop asks: once before
+    // the encoder pass, then once per generated token.
+    let dir = encoder_decoder_dir(&base_config());
+    let mut pipeline = PipelineKind::Seq2Seq(load(&dir));
+    let prepared = pipeline
+        .prepare("a b c d e f g h".to_string())
+        .expect("prepare");
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&asked);
+    let control = GenerationControl::new().with_cancel_check(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 3
+    });
+
+    // Act
+    let result = pipeline.execute_with(prepared, &control);
+
+    // Assert -- two tokens were generated, the third was never started.
+    let err = result.err().expect("cancelled generation should fail");
+    assert!(matches!(err, CoreError::Cancelled(_)), "{err:?}");
+    assert!(err.to_string().contains("after 2 tokens"), "{err}");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 4);
+}
+
+#[test]
+fn encoder_decoder_execution_reports_token_counts() {
+    // Arrange -- the fixture echoes its input: <s> a b c </s> is five
+    // encoder tokens, and "a b c" plus the end token four generated ones.
+    let dir = encoder_decoder_dir(&base_config());
+    let mut pipeline = PipelineKind::Seq2Seq(load(&dir));
+    let prepared = pipeline.prepare("a b c".to_string()).expect("prepare");
+
+    // Act
+    let execution = pipeline
+        .execute_with(prepared, &GenerationControl::default())
+        .expect("execute");
+
+    // Assert
+    let usage = execution.usage.expect("encoder-decoder mode counts tokens");
+    assert_eq!(usage.prompt_tokens, 5);
+    assert_eq!(usage.completion_tokens, 4);
+    assert_eq!(
+        execution.to_json(),
+        serde_json::json!({
+            "generated_text": "a b c",
+            "prompt_tokens": 5,
+            "completion_tokens": 4,
+        })
+    );
+}
+
+#[test]
+fn fused_model_execution_has_no_token_counts_and_the_same_json() {
+    // Arrange
+    let dir = model_dir(&base_config(), &[(FUSED, FUSED)]);
+    let mut pipeline = PipelineKind::Seq2Seq(load(&dir));
+    let prepared = pipeline.prepare("a b c".to_string()).expect("prepare");
+    let again = pipeline.prepare("a b c".to_string()).expect("prepare");
+
+    // Act -- an expired deadline and a cancelled caller: a single forward
+    // pass ignores both.
+    let control = GenerationControl::new()
+        .with_deadline(std::time::Instant::now())
+        .with_cancel_check(|| true);
+    let execution = pipeline.execute_with(prepared, &control).expect("execute");
+    let plain = pipeline.execute(again).expect("execute");
+
+    // Assert
+    assert_eq!(execution.usage, None::<TokenUsage>);
+    assert_eq!(execution.to_json().to_string(), plain.to_json().to_string());
 }

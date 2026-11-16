@@ -12,9 +12,7 @@ use crate::error::CoreError;
 use super::asr::AudioFeatures;
 use super::text_generation::PromptBuilder;
 use super::token_classifier::tokenize_keeping_encoding;
-use super::{
-    InferenceInput, PipelineKind, PreparedData, TextGenerationInput, tokenize_text,
-};
+use super::{InferenceInput, PipelineKind, PreparedData, TextGenerationInput, tokenize_text};
 
 /// How one profile prepares its input.
 enum Kind {
@@ -177,8 +175,13 @@ mod tests {
             "{name}"
         );
         for (from_pipeline, from_preparer) in inputs().into_iter().zip(inputs()) {
-            match (pipeline.prepare(from_pipeline), preparer.prepare(from_preparer)) {
-                (Ok(expected), Ok(actual)) => assert_eq!(fields(actual), fields(expected), "{name}"),
+            match (
+                pipeline.prepare(from_pipeline),
+                preparer.prepare(from_preparer),
+            ) {
+                (Ok(expected), Ok(actual)) => {
+                    assert_eq!(fields(actual), fields(expected), "{name}")
+                }
                 (Err(expected), Err(actual)) => {
                     assert_eq!(actual.to_string(), expected.to_string(), "{name}");
                 }
@@ -201,8 +204,11 @@ mod tests {
             std::fs::copy(fixture("seq2seq", name), encoder_decoder.path().join(name))
                 .expect("copy fixture");
         }
-        std::fs::copy(dir.path().join("config.json"), encoder_decoder.path().join("config.json"))
-            .expect("copy config");
+        std::fs::copy(
+            dir.path().join("config.json"),
+            encoder_decoder.path().join("config.json"),
+        )
+        .expect("copy config");
         let text_generation = tempfile::tempdir().expect("temp dir");
         for (from, name) in [
             ("text_generation", "model.onnx"),
@@ -212,8 +218,11 @@ mod tests {
             std::fs::copy(fixture(from, name), text_generation.path().join(name))
                 .expect("copy fixture");
         }
-        std::fs::copy(dir.path().join("config.json"), text_generation.path().join("config.json"))
-            .expect("copy config");
+        std::fs::copy(
+            dir.path().join("config.json"),
+            text_generation.path().join("config.json"),
+        )
+        .expect("copy config");
 
         let pipelines = [
             (

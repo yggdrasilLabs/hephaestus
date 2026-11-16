@@ -21,4 +21,4 @@ pub use batcher::{Batcher, batcher_loop};
 pub use metrics::{StageTimer, install_recorder};
 pub use routes::build_router;
 pub use state::AppState;
-pub use worker::{DEFAULT_QUEUE_CAPACITY, InferenceTicket};
+pub use worker::{CancelFlag, DEFAULT_QUEUE_CAPACITY, InferenceTicket};

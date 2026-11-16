@@ -68,7 +68,9 @@ fn request_input(
 /// The response shape depends on the loaded model profile:
 /// - Classifier: `{"label": "...", "score": ..., "model_id": "...", "latency_ms": ...}`
 /// - Embeddings: `{"embedding": [...], "model_id": "...", "latency_ms": ...}`
-/// - Seq2seq and text generation: `{"generated_text": "...", "model_id": "...", "latency_ms": ...}`
+/// - Seq2seq and text generation: `{"generated_text": "...", "model_id": "...", "latency_ms": ...}`,
+///   plus `prompt_tokens` and `completion_tokens` when the model generates
+///   token by token (text generation, encoder-decoder seq2seq)
 ///
 /// # Errors
 ///
@@ -76,6 +78,8 @@ fn request_input(
 /// - 503 if the service is not ready, or (with `Retry-After`) if the
 ///   inference queue is full
 /// - 400 if the request text is empty
+/// - 413 if the prompt of a text generation request exceeds the input
+///   token cap
 /// - 422 if tokenization fails
 /// - 504 if inference times out (D-14)
 /// - 500 if inference fails
@@ -113,7 +117,7 @@ pub async fn infer(
                 .ok_or(ApiError::Internal("batcher not available".to_string()))?
                 .submit(prepared, Some(deadline))
                 .await?;
-            Ok::<_, ApiError>(pipeline_output.to_json())
+            Ok::<_, ApiError>((pipeline_output.to_json(), pipeline_output.usage))
         } else {
             // Direct path (D-07): take a place in the inference queue first,
             // so a request that cannot be queued is refused at once, then
@@ -123,14 +127,15 @@ pub async fn infer(
             let prepared = timer.time("tokenization", || state.prepare(input))?;
             // The model runs on the inference worker thread, so this task
             // only waits. Dropping this future (timeout, client gone)
-            // takes a job that is still queued out of the queue.
+            // takes a job that is still queued out of the queue and stops
+            // a generation that is running.
             let pipeline_output = ticket.run(prepared, Some(timer.clone())).await?;
-            Ok::<_, ApiError>(pipeline_output.to_json())
+            Ok::<_, ApiError>((pipeline_output.to_json(), pipeline_output.usage))
         }
     })
     .await;
 
-    let mut output = match result {
+    let (mut output, usage) = match result {
         Ok(inner) => match inner {
             Ok(output) => {
                 timer.finish_request(request_start, true);
@@ -178,6 +183,8 @@ pub async fn infer(
     tracing::info!(
         model_id = %state.model_id(),
         latency_ms,
+        prompt_tokens = usage.map(|usage| usage.prompt_tokens),
+        completion_tokens = usage.map(|usage| usage.completion_tokens),
         status = "success",
         "inference request completed"
     );
@@ -234,7 +241,10 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::response::Response;
-    use hephaestus_core::{ExecutionProvider, PipelineKind, Seq2SeqPipeline};
+    use hephaestus_core::{
+        ExecutionProvider, PipelineKind, Seq2SeqPipeline, TextGenerationOptions,
+        TextGenerationPipeline,
+    };
     use tower::ServiceExt;
 
     use super::*;
@@ -400,60 +410,360 @@ mod tests {
         assert_eq!(body["model_id"], "fixture/model");
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn timed_out_request_keeps_the_worker_busy_until_its_inference_ends() {
-        // Arrange -- inference outlasts the request timeout; the hook
-        // counts how many inferences run at the same moment.
-        let running = Arc::new(AtomicUsize::new(0));
-        let most_at_once = Arc::new(AtomicUsize::new(0));
-        let runs = Arc::new(AtomicUsize::new(0));
-        let (hook_running, hook_most, hook_runs) = (
-            Arc::clone(&running),
-            Arc::clone(&most_at_once),
-            Arc::clone(&runs),
-        );
-        let (state, _dir) = fixture_state(Duration::from_millis(100), move || {
-            let now = hook_running.fetch_add(1, Ordering::SeqCst) + 1;
-            hook_most.fetch_max(now, Ordering::SeqCst);
-            hook_runs.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(400));
-            hook_running.fetch_sub(1, Ordering::SeqCst);
+    /// A real (tiny) decoder-only pipeline from the fixture graphs of
+    /// `hephaestus-core`, with a prompt cap of 16 tokens. Its model never
+    /// emits an end token, so every generation runs for `max_new_tokens`
+    /// steps unless something stops it.
+    fn text_generation_pipeline(max_new_tokens: usize) -> (PipelineKind, tempfile::TempDir) {
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../hephaestus-core/tests/fixtures");
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (from, file) in [
+            ("text_generation", "model.onnx"),
+            ("text_generation", "tokenizer_config.json"),
+            ("seq2seq", "tokenizer.json"),
+        ] {
+            std::fs::copy(fixtures.join(from).join(file), dir.path().join(file))
+                .expect("copy fixture");
+        }
+        let config = serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "bos_token_id": 0,
+            "max_position_embeddings": 512,
+            "vocab_size": 16
         });
+        std::fs::write(dir.path().join("config.json"), config.to_string()).expect("write config");
+        let options = TextGenerationOptions::new()
+            .with_max_input_tokens(16)
+            .with_max_new_tokens(max_new_tokens);
+        let pipeline =
+            TextGenerationPipeline::with_options(dir.path(), &ExecutionProvider::Cpu, &options)
+                .expect("pipeline should load");
+        (PipelineKind::TextGeneration(pipeline), dir)
+    }
+
+    /// Token steps a generation of [`slow_generation_state`] runs when
+    /// nothing stops it.
+    const SLOW_GENERATION_STEPS: usize = 400;
+    /// Time [`slow_generation_state`] spends on each token step.
+    const STEP_TIME: Duration = Duration::from_millis(5);
+
+    /// State around a text generation model whose every token step takes
+    /// [`STEP_TIME`] while `slow` is set: two seconds for a whole
+    /// generation. Returns the state, the number of token steps asked for
+    /// so far, and the `slow` switch.
+    fn slow_generation_state(
+        request_timeout: Duration,
+        batcher: Option<Batcher>,
+    ) -> (
+        Arc<AppState>,
+        Arc<AtomicUsize>,
+        Arc<AtomicBool>,
+        tempfile::TempDir,
+    ) {
+        let (pipeline, dir) = text_generation_pipeline(SLOW_GENERATION_STEPS);
+        let state = state_for(pipeline, request_timeout, batcher);
+        let steps = Arc::new(AtomicUsize::new(0));
+        let slow = Arc::new(AtomicBool::new(true));
+        let (hook_steps, hook_slow) = (Arc::clone(&steps), Arc::clone(&slow));
+        state.set_on_generation_step(move || {
+            hook_steps.fetch_add(1, Ordering::SeqCst);
+            if hook_slow.load(Ordering::SeqCst) {
+                std::thread::sleep(STEP_TIME);
+            }
+        });
+        (Arc::new(state), steps, slow, dir)
+    }
+
+    /// Wait until the worker has finished everything queued before this
+    /// call: a job that is already past its deadline is answered, without
+    /// running, as soon as the worker reaches it.
+    async fn worker_reaches_the_end_of_its_queue(state: &AppState) {
+        let ticket = state.admit(Some(Instant::now())).expect("queue has room");
+        let prepared = state
+            .prepare("a".to_string())
+            .expect("prepare should succeed");
+        let result = ticket.run(prepared, None).await;
+        assert!(matches!(result, Err(ApiError::Timeout)));
+    }
+
+    /// Assert that a generation was stopped soon after `steps_when_left`
+    /// steps, far from its natural end.
+    fn assert_stopped_within_a_few_steps(steps: &AtomicUsize, steps_when_left: usize) {
+        let steps = steps.load(Ordering::SeqCst);
+        assert!(
+            steps <= steps_when_left + 4,
+            "generation went on for {} steps after its caller left",
+            steps - steps_when_left
+        );
+        assert!(steps < SLOW_GENERATION_STEPS / 4, "{steps} steps ran");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timed_out_request_stops_its_generation() {
+        // Arrange -- a generation of two seconds against a timeout of 100 ms.
+        let (state, steps, slow, _dir) = slow_generation_state(Duration::from_millis(100), None);
         let app = crate::build_router(Arc::clone(&state));
 
-        // Act -- the request gives up after 100 ms; its inference goes on.
+        // Act -- the request gives up after 100 ms.
         let asked = Instant::now();
-        let response = app
-            .oneshot(infer_request("a b c"))
-            .await
-            .expect("infallible");
+        let response = app.oneshot(infer_request("a b")).await.expect("infallible");
         let timed_out_after = asked.elapsed();
-        let abandoned_still_running = running.load(Ordering::SeqCst) == 1;
-        // A second inference, with no timeout of its own, must wait for it.
+        worker_reaches_the_end_of_its_queue(&state).await;
+        let stopped_after = asked.elapsed();
+        let steps_run = steps.load(Ordering::SeqCst);
+        // The worker is free again: a second generation, at full speed and
+        // with no timeout of its own, runs to its end.
+        slow.store(false, Ordering::SeqCst);
         let ticket = state.admit(None).expect("queue has room");
         let prepared = state
-            .prepare("d e f".to_string())
+            .prepare("a b".to_string())
             .expect("prepare should succeed");
-        let output = ticket
+        let second = ticket
             .run(prepared, None)
             .await
             .expect("inference should succeed");
 
-        // Assert
+        // Assert -- the timed-out generation was cut short, not run out.
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert!(
             timed_out_after < Duration::from_millis(350),
             "504 after {timed_out_after:?}"
         );
         assert!(
-            abandoned_still_running,
-            "abandoned inference should still be running"
+            stopped_after < Duration::from_secs(1),
+            "generation still running {stopped_after:?} after the request"
         );
-        assert_eq!(runs.load(Ordering::SeqCst), 2, "both inferences ran");
-        assert_eq!(most_at_once.load(Ordering::SeqCst), 1, "never two at once");
+        assert!(
+            (1..SLOW_GENERATION_STEPS / 4).contains(&steps_run),
+            "{steps_run} steps ran"
+        );
+        let usage = second.usage.expect("text generation counts tokens");
+        assert_eq!(usage.completion_tokens, SLOW_GENERATION_STEPS);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_request_stops_its_running_generation() {
+        // Arrange -- a generation of two seconds, well inside the timeout.
+        let (state, steps, _slow, _dir) = slow_generation_state(Duration::from_secs(30), None);
+        let app = crate::build_router(Arc::clone(&state));
+        let request = tokio::spawn(app.oneshot(infer_request("a b")));
+        until("the generation to start", || {
+            steps.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+
+        // Act -- the handler future is dropped, as axum does when the
+        // client disconnects.
+        let steps_when_left = steps.load(Ordering::SeqCst);
+        request.abort();
+        worker_reaches_the_end_of_its_queue(&state).await;
+
+        // Assert
+        assert_stopped_within_a_few_steps(&steps, steps_when_left);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_client_disconnect_stops_its_running_generation() {
+        use tokio::io::AsyncWriteExt;
+
+        // Arrange -- the real server on a local socket.
+        let (state, steps, _slow, _dir) = slow_generation_state(Duration::from_secs(30), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("local address");
+        let server = tokio::spawn(
+            axum::serve(listener, crate::build_router(Arc::clone(&state))).into_future(),
+        );
+        let body = serde_json::json!({ "text": "a b" }).to_string();
+        let request = format!(
+            "POST /infer HTTP/1.1\r\nhost: {address}\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("send request");
+        until("the generation to start", || {
+            steps.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+
+        // Act -- the client closes its connection without waiting.
+        let steps_when_left = steps.load(Ordering::SeqCst);
+        drop(client);
+        worker_reaches_the_end_of_its_queue(&state).await;
+
+        // Assert
+        assert_stopped_within_a_few_steps(&steps, steps_when_left);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_grpc_call_stops_its_running_generation() {
+        use hephaestus_proto::v1::inference_service_server::InferenceService;
+
+        // Arrange
+        let (state, steps, _slow, _dir) = slow_generation_state(Duration::from_secs(30), None);
+        let service = crate::grpc::GrpcInferenceService::new(Arc::clone(&state));
+        let call = tokio::spawn(async move {
+            service
+                .infer(tonic::Request::new(hephaestus_proto::v1::InferRequest {
+                    text: "a b".to_string(),
+                }))
+                .await
+        });
+        until("the generation to start", || {
+            steps.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+
+        // Act -- the call's future is dropped, as tonic does when the
+        // client cancels.
+        let steps_when_left = steps.load(Ordering::SeqCst);
+        call.abort();
+        worker_reaches_the_end_of_its_queue(&state).await;
+
+        // Assert
+        assert_stopped_within_a_few_steps(&steps, steps_when_left);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_batched_request_stops_its_running_generation() {
+        // Arrange -- batching on: the request reaches the worker in a batch.
+        let (batcher, receiver) = Batcher::new(2);
+        let (state, steps, _slow, _dir) =
+            slow_generation_state(Duration::from_secs(30), Some(batcher));
+        let batcher_task = tokio::spawn(batcher_loop(
+            receiver,
+            Arc::clone(&state),
+            2,
+            Duration::from_millis(10),
+        ));
+        let app = crate::build_router(Arc::clone(&state));
+        let request = tokio::spawn(app.oneshot(infer_request("a b")));
+        until("the generation to start", || {
+            steps.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+
+        // Act
+        let steps_when_left = steps.load(Ordering::SeqCst);
+        request.abort();
+        worker_reaches_the_end_of_its_queue(&state).await;
+
+        // Assert
+        assert_stopped_within_a_few_steps(&steps, steps_when_left);
+        batcher_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn over_long_prompt_is_refused_with_413_even_while_the_model_is_busy() {
+        use hephaestus_proto::v1::inference_service_server::InferenceService;
+
+        // Arrange -- a prompt cap of 16 tokens; the model is held by a
+        // first request.
+        let (hook, started, release) = gated_hook();
+        let (pipeline, _dir) = text_generation_pipeline(4);
+        let state = state_for(pipeline, Duration::from_secs(30), None);
+        state.set_before_inference(hook);
+        let state = Arc::new(state);
+        let app = crate::build_router(Arc::clone(&state));
+        let first = tokio::spawn(app.clone().oneshot(infer_request("a b")));
+        until("the first run", || started.load(Ordering::SeqCst) == 1).await;
+        // 40 words; the chat template adds three tokens.
+        let long_text = ["a b c d e f g h i j"; 4].join(" ");
+
+        // Act
+        let asked = Instant::now();
+        let response = app
+            .clone()
+            .oneshot(infer_request(&long_text))
+            .await
+            .expect("infallible");
+        let refused_in = asked.elapsed();
+        let grpc = crate::grpc::GrpcInferenceService::new(Arc::clone(&state))
+            .infer(tonic::Request::new(hephaestus_proto::v1::InferRequest {
+                text: long_text.clone(),
+            }))
+            .await;
+        let queued_after = state.waiting_requests();
+
+        // Assert -- a client error that states both numbers, at once.
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            refused_in < Duration::from_secs(1),
+            "413 after {refused_in:?}"
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "INPUT_TOO_LONG");
         assert_eq!(
-            output.to_json(),
-            serde_json::json!({ "generated_text": "d e f" })
+            body["error"]["message"],
+            "input too long: the prompt has 43 tokens, the limit is 16"
+        );
+        let status = grpc.expect_err("gRPC call should fail");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "input too long: the prompt has 43 tokens, the limit is 16"
+        );
+        assert_eq!(queued_after, 0, "the refused requests left the queue");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "nothing was truncated and run"
+        );
+
+        // The request that fits is unaffected.
+        drop(release);
+        let first = first.await.expect("task should join").expect("infallible");
+        assert_eq!(first.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generation_responses_carry_token_counts() {
+        // Arrange -- text generation that runs for exactly 6 tokens, and
+        // the seq2seq fixture, which echoes its input.
+        let (pipeline, _text_generation_dir) = text_generation_pipeline(6);
+        let text_generation =
+            crate::build_router(Arc::new(state_for(pipeline, Duration::from_secs(30), None)));
+        let (state, _seq2seq_dir) = fixture_state(Duration::from_secs(30), || {});
+        let seq2seq = crate::build_router(state);
+
+        // Act
+        let text_generation = text_generation
+            .oneshot(infer_request("a b"))
+            .await
+            .expect("infallible");
+        let seq2seq = seq2seq
+            .oneshot(infer_request("a b c"))
+            .await
+            .expect("infallible");
+
+        // Assert -- the prompt is "c a b d e" (template around the text);
+        // the seq2seq input is <s> a b c </s>, its output "a b c" </s>.
+        assert_eq!(text_generation.status(), StatusCode::OK);
+        let body = json_body(text_generation).await;
+        assert_eq!(body["prompt_tokens"], 5);
+        assert_eq!(body["completion_tokens"], 6);
+        assert!(body["generated_text"].is_string());
+        assert_eq!(seq2seq.status(), StatusCode::OK);
+        let mut body = json_body(seq2seq).await;
+        assert!(body["latency_ms"].is_u64());
+        body.as_object_mut().expect("object").remove("latency_ms");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "generated_text": "a b c",
+                "prompt_tokens": 5,
+                "completion_tokens": 4,
+                "model_id": "fixture/model",
+            })
         );
     }
 
@@ -462,8 +772,8 @@ mod tests {
         // Arrange -- room for one waiting request; the model is held.
         let (hook, started, release) = gated_hook();
         let (pipeline, _dir) = seq2seq_pipeline();
-        let state = state_for(pipeline, Duration::from_secs(30), None)
-            .with_inference_queue_capacity(1);
+        let state =
+            state_for(pipeline, Duration::from_secs(30), None).with_inference_queue_capacity(1);
         state.set_before_inference(hook);
         let state = Arc::new(state);
         let app = crate::build_router(Arc::clone(&state));
@@ -487,7 +797,10 @@ mod tests {
         // Assert -- refused without waiting for the model.
         assert_eq!(third.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(third.headers()["retry-after"], "1");
-        assert!(refused_in < Duration::from_secs(1), "503 after {refused_in:?}");
+        assert!(
+            refused_in < Duration::from_secs(1),
+            "503 after {refused_in:?}"
+        );
         let body = json_body(third).await;
         assert_eq!(body["error"]["code"], "QUEUE_FULL");
         assert_eq!(started.load(Ordering::SeqCst), 1, "only one run started");
@@ -495,13 +808,19 @@ mod tests {
         // The two accepted requests are served once the model is free.
         drop(release);
         for (request, expected) in [(first, "a b c"), (second, "d e f")] {
-            let response = request.await.expect("task should join").expect("infallible");
+            let response = request
+                .await
+                .expect("task should join")
+                .expect("infallible");
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(json_body(response).await["generated_text"], expected);
         }
         assert_eq!(state.waiting_requests(), 0);
         // With the queue empty again, a new request is accepted.
-        let response = app.oneshot(infer_request("j k l")).await.expect("infallible");
+        let response = app
+            .oneshot(infer_request("j k l"))
+            .await
+            .expect("infallible");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -530,7 +849,10 @@ mod tests {
         let first = first.await.expect("task should join").expect("infallible");
         // A request sent once the model is free again runs normally.
         tokio::time::sleep(Duration::from_millis(600)).await;
-        let third = app.oneshot(infer_request("g h i")).await.expect("infallible");
+        let third = app
+            .oneshot(infer_request("g h i"))
+            .await
+            .expect("infallible");
 
         // Assert
         assert_eq!(first.status(), StatusCode::GATEWAY_TIMEOUT);
@@ -538,7 +860,11 @@ mod tests {
         assert_eq!(queue_after_timeout, 0, "the dead job left the queue");
         assert_eq!(third.status(), StatusCode::OK);
         assert_eq!(json_body(third).await["generated_text"], "g h i");
-        assert_eq!(runs.load(Ordering::SeqCst), 2, "the queued request never ran");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "the queued request never ran"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -549,9 +875,7 @@ mod tests {
         let (state, _dir) = fixture_state(Duration::from_secs(30), move || {
             hook_runs.fetch_add(1, Ordering::SeqCst);
         });
-        let ticket = state
-            .admit(Some(Instant::now()))
-            .expect("queue has room");
+        let ticket = state.admit(Some(Instant::now())).expect("queue has room");
         let prepared = state
             .prepare("a b c".to_string())
             .expect("prepare should succeed");
@@ -588,7 +912,10 @@ mod tests {
         .await;
         drop(release);
         let first = first.await.expect("task should join").expect("infallible");
-        let third = app.oneshot(infer_request("g h i")).await.expect("infallible");
+        let third = app
+            .oneshot(infer_request("g h i"))
+            .await
+            .expect("infallible");
 
         // Assert -- only the first and third requests ran.
         assert_eq!(first.status(), StatusCode::OK);
@@ -625,7 +952,10 @@ mod tests {
 
         // Assert -- every request got its own answer, one run at a time.
         for (request, text) in requests.into_iter().zip(texts) {
-            let response = request.await.expect("task should join").expect("infallible");
+            let response = request
+                .await
+                .expect("task should join")
+                .expect("infallible");
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(json_body(response).await["generated_text"], text);
         }
@@ -651,24 +981,40 @@ mod tests {
         state.shutdown_inference();
         let mut queued_statuses = Vec::new();
         for request in queued {
-            let response = request.await.expect("task should join").expect("infallible");
+            let response = request
+                .await
+                .expect("task should join")
+                .expect("infallible");
             queued_statuses.push((response.status(), json_body(response).await));
         }
         let running_was_unfinished = !running.is_finished();
         // Readiness is the caller's to flip; a request that still gets in
         // is refused by the closed queue.
-        let late = app.clone().oneshot(infer_request("j k l")).await.expect("infallible");
+        let late = app
+            .clone()
+            .oneshot(infer_request("j k l"))
+            .await
+            .expect("infallible");
         drop(release);
-        let running = running.await.expect("task should join").expect("infallible");
+        let running = running
+            .await
+            .expect("task should join")
+            .expect("infallible");
 
         // Assert
         for (status, body) in queued_statuses {
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(body["error"]["code"], "NOT_READY");
         }
-        assert!(running_was_unfinished, "queued jobs failed before the running one ended");
+        assert!(
+            running_was_unfinished,
+            "queued jobs failed before the running one ended"
+        );
         assert_eq!(late.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(state.is_ready(), "shutdown_inference leaves readiness alone");
+        assert!(
+            state.is_ready(),
+            "shutdown_inference leaves readiness alone"
+        );
         assert_eq!(running.status(), StatusCode::OK);
         assert_eq!(json_body(running).await["generated_text"], "a b c");
         assert_eq!(started.load(Ordering::SeqCst), 1, "queued jobs never ran");
@@ -704,7 +1050,10 @@ mod tests {
 
         // Assert -- each got its own answer, from a single job.
         for (request, text) in requests.into_iter().zip(texts) {
-            let response = request.await.expect("task should join").expect("infallible");
+            let response = request
+                .await
+                .expect("task should join")
+                .expect("infallible");
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(json_body(response).await["generated_text"], text);
         }

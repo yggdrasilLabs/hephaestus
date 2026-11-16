@@ -1,6 +1,7 @@
 //! Integration tests for the inference queue: admission, the 503 for a
-//! full queue, and the queue metrics, through the public API and the real
-//! router, over the tiny seq2seq fixture graphs of `hephaestus-core`.
+//! full queue, and the queue and token metrics, through the public API and
+//! the real router, over the tiny seq2seq fixture graphs of
+//! `hephaestus-core`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -72,12 +73,20 @@ async fn queue_metrics_follow_admission_rejection_and_runs() {
     // Act -- two callers hold the two places; a request finds none.
     let first = state.admit(None).expect("first place");
     let second = state.admit(None).expect("second place");
-    let refused = app.clone().oneshot(infer_request("a b c")).await.expect("infallible");
+    let refused = app
+        .clone()
+        .oneshot(infer_request("a b c"))
+        .await
+        .expect("infallible");
     let while_full = state.render_metrics();
     // The places are given back; the next request runs.
     drop(first);
     drop(second);
-    let served = app.clone().oneshot(infer_request("a b c")).await.expect("infallible");
+    let served = app
+        .clone()
+        .oneshot(infer_request("a b c"))
+        .await
+        .expect("infallible");
     let afterwards = state.render_metrics();
 
     // Assert -- the refusal.
@@ -99,7 +108,11 @@ async fn queue_metrics_follow_admission_rejection_and_runs() {
     );
     // Nothing had run yet, so no queue wait was recorded.
     assert_eq!(
-        sample(&while_full, "hephaestus_inference_queue_wait_seconds_count", &[model]),
+        sample(
+            &while_full,
+            "hephaestus_inference_queue_wait_seconds_count",
+            &[model]
+        ),
         None,
         "{while_full}"
     );
@@ -112,7 +125,11 @@ async fn queue_metrics_follow_admission_rejection_and_runs() {
         "{afterwards}"
     );
     assert_eq!(
-        sample(&afterwards, "hephaestus_inference_queue_wait_seconds_count", &[model]),
+        sample(
+            &afterwards,
+            "hephaestus_inference_queue_wait_seconds_count",
+            &[model]
+        ),
         Some(1.0),
         "{afterwards}"
     );
@@ -125,4 +142,38 @@ async fn queue_metrics_follow_admission_rejection_and_runs() {
         Some(1.0),
         "{afterwards}"
     );
+
+    // Assert -- its tokens: <s> a b c </s> read, "a b c" </s> generated.
+    let body = axum::body::to_bytes(served.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+    assert_eq!(body["prompt_tokens"], 5);
+    assert_eq!(body["completion_tokens"], 4);
+    assert_eq!(
+        sample(&afterwards, "hephaestus_prompt_tokens_total", &[model]),
+        Some(5.0),
+        "{afterwards}"
+    );
+    assert_eq!(
+        sample(&afterwards, "hephaestus_generated_tokens_total", &[model]),
+        Some(4.0),
+        "{afterwards}"
+    );
+    assert_eq!(
+        sample(
+            &afterwards,
+            "hephaestus_generation_tokens_per_second_count",
+            &[model]
+        ),
+        Some(1.0),
+        "{afterwards}"
+    );
+    let rate = sample(
+        &afterwards,
+        "hephaestus_generation_tokens_per_second_sum",
+        &[model],
+    )
+    .expect("token rate recorded");
+    assert!(rate > 0.0, "{afterwards}");
 }

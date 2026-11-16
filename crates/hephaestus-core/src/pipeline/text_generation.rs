@@ -29,12 +29,14 @@ use crate::ep::ExecutionProvider;
 use crate::error::CoreError;
 
 use super::chat_template::ChatTemplate;
+use super::control::{GenerationControl, TokenUsage, tokens_per_second};
 use super::encoder_decoder::{
     TensorSpec, argmax_excluding, extend_with_repeating_tokens, int64_tensor, parse_token_id,
     read_json, spec_names,
 };
 use super::{
-    Pipeline, PipelineOutput, PreparedData, PreparedInput, build_onnx_session, resolve_onnx_path,
+    Execution, Pipeline, PipelineOutput, PreparedData, PreparedInput, build_onnx_session,
+    resolve_onnx_path,
 };
 
 /// Smallest accepted input token cap: below this no prompt fits.
@@ -60,11 +62,6 @@ const PAST_INPUT_PREFIX: &str = "past_key_values.";
 /// Prefix of the key/value cache outputs; the rest of the name matches the
 /// input it feeds on the next step.
 const PRESENT_OUTPUT_PREFIX: &str = "present.";
-
-/// How often a prompt above the input cap is shortened and measured again.
-/// One pass is the rule; a second covers tokens that merge differently at
-/// the new end of the text.
-const MAX_TRUNCATION_PASSES: usize = 4;
 
 /// Generation settings that change which token greedy decoding picks and
 /// that this pipeline does not implement. Their presence is logged.
@@ -114,8 +111,9 @@ impl TextGenerationOptions {
     /// Accept prompts of at most `tokens` tokens, counting the template,
     /// the system message and the user message.
     ///
-    /// A longer prompt has the end of its user message cut off. Unset, the
-    /// cap is 4096 tokens, or less when the model's context is smaller.
+    /// A request with a longer prompt is refused with
+    /// [`CoreError::InputTooLong`]. Unset, the cap is 4096 tokens, or less
+    /// when the model's context is smaller.
     pub fn with_max_input_tokens(mut self, tokens: usize) -> Self {
         self.max_input_tokens = Some(tokens);
         self
@@ -534,16 +532,6 @@ fn penalize_repeats(logits: &mut [f32], tokens: &[i64], penalty: f32) {
     }
 }
 
-/// Fail with [`CoreError::Timeout`] if the deadline has passed.
-fn ensure_before(deadline: Option<Instant>, generated: usize) -> Result<(), CoreError> {
-    match deadline {
-        Some(deadline) if Instant::now() >= deadline => Err(CoreError::Timeout(format!(
-            "text generation exceeded its time budget after {generated} tokens",
-        ))),
-        _ => Ok(()),
-    }
-}
-
 /// Everything needed to turn a request into a tokenized prompt.
 ///
 /// Split from the pipeline so requests can be prepared while the model is
@@ -559,53 +547,42 @@ pub(super) struct PromptBuilder {
 }
 
 impl PromptBuilder {
-    /// Render and tokenize the prompt, shortening the user message when
-    /// the prompt is above the input cap.
+    /// Render and tokenize the prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InputTooLong`] if the prompt has more tokens
+    /// than the input cap. Nothing is cut to make it fit: which part of a
+    /// request may be dropped is for the caller to decide.
     pub(super) fn prepare(&self, input: TextGenerationInput) -> Result<PreparedInput, CoreError> {
         let system = match input.system {
             Some(system) => Some(system).filter(|system| !system.is_empty()),
             None => self.system_prompt.clone(),
         };
-        let cap = self.max_input_tokens;
-        let mut text = input.text;
-
-        for _ in 0..MAX_TRUNCATION_PASSES {
-            let prompt = self.template.render(system.as_deref(), &text)?;
-            // The template writes every special token itself.
-            let encoding = self
-                .tokenizer
-                .encode(prompt.as_str(), false)
-                .map_err(|e| CoreError::Tokenization(e.to_string()))?;
-            let length = encoding.len();
-            if length == 0 {
-                return Err(CoreError::InvalidInput(
-                    "chat template rendered an empty prompt".to_string(),
-                ));
-            }
-            if length <= cap {
-                return Ok(PreparedInput {
-                    input_ids: encoding.get_ids().iter().map(|&id| i64::from(id)).collect(),
-                    attention_mask: vec![1; length],
-                    sequence_length: length,
-                    encoding: None,
-                });
-            }
-            text = shorten_user_text(&prompt, encoding.get_offsets(), &text, length - cap)
-                .ok_or_else(|| {
-                    CoreError::InvalidInput(format!(
-                        "prompt has {length} tokens, more than the limit of {cap}, and cannot \
-                         be shortened by cutting the user text",
-                    ))
-                })?;
-            tracing::debug!(
-                prompt_tokens = length,
-                max_input_tokens = cap,
-                "prompt above the input cap; user text truncated"
-            );
+        let prompt = self.template.render(system.as_deref(), &input.text)?;
+        // The template writes every special token itself.
+        let encoding = self
+            .tokenizer
+            .encode(prompt.as_str(), false)
+            .map_err(|e| CoreError::Tokenization(e.to_string()))?;
+        let length = encoding.len();
+        if length == 0 {
+            return Err(CoreError::InvalidInput(
+                "chat template rendered an empty prompt".to_string(),
+            ));
         }
-        Err(CoreError::InvalidInput(format!(
-            "prompt does not fit the limit of {cap} tokens",
-        )))
+        if length > self.max_input_tokens {
+            return Err(CoreError::InputTooLong {
+                tokens: length,
+                limit: self.max_input_tokens,
+            });
+        }
+        Ok(PreparedInput {
+            input_ids: encoding.get_ids().iter().map(|&id| i64::from(id)).collect(),
+            attention_mask: vec![1; length],
+            sequence_length: length,
+            encoding: None,
+        })
     }
 }
 
@@ -670,8 +647,8 @@ impl TextGenerationPipeline {
             resolve_max_input_tokens(&config, options.max_input_tokens, settings.max_new_tokens)?;
         let template = ChatTemplate::load(model_dir)?;
 
-        // 2. Tokenizer. The prompt is cut to size before tokenization and
-        //    one request is one sequence, so neither truncate nor pad.
+        // 2. Tokenizer. A prompt above the cap is refused and one request
+        //    is one sequence, so neither truncate nor pad.
         let mut tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| CoreError::Tokenization(e.to_string()))?;
         tokenizer
@@ -763,30 +740,55 @@ impl TextGenerationPipeline {
     /// fails to run.
     pub fn warm_up(&mut self) -> Result<(), CoreError> {
         let prepared = self.prepare_prompt(TextGenerationInput::from("Hello".to_string()))?;
-        self.generate(&prepared, None, 1, &mut |_| {}).map(|_| ())
+        self.generate(&prepared, &GenerationControl::default(), 1, &mut |_| {})
+            .map(|_| ())
     }
 
     /// Run generation for a batch, one request after another.
     ///
     /// Generation is token by token, so requests cannot share one padded
     /// forward pass the way the single-pass profiles do. Returns one
-    /// result per request, in order. The time budget covers the batch.
+    /// result per request, in order. The time budget covers the batch;
+    /// `controls[i]`, when present, limits request `i` further.
     pub(super) fn execute_batch_sequential(
         &mut self,
         batch: Vec<PreparedData>,
-    ) -> Vec<Result<PipelineOutput, CoreError>> {
+        controls: &[GenerationControl],
+    ) -> Vec<Result<Execution, CoreError>> {
         let deadline = self.deadline_from_now();
+        let unlimited = GenerationControl::default();
         batch
             .into_iter()
-            .map(|item| match item {
-                PreparedData::Text(prepared) => self
-                    .generate_text(&prepared, deadline)
-                    .map(PipelineOutput::TextGeneration),
+            .enumerate()
+            .map(|(index, item)| match item {
+                PreparedData::Text(prepared) => {
+                    let control = controls.get(index).unwrap_or(&unlimited).limited_to(deadline);
+                    let (text, usage) = self.generate_text(&prepared, &control)?;
+                    Ok(Execution {
+                        output: PipelineOutput::TextGeneration(text),
+                        usage: Some(usage),
+                    })
+                }
                 PreparedData::Audio(_) => Err(CoreError::InvalidInput(
                     "text pipeline received audio prepared data in batch".to_string(),
                 )),
             })
             .collect()
+    }
+
+    /// Generate the reply to one prepared prompt within `control`'s limits
+    /// and this pipeline's own time budget.
+    ///
+    /// # Errors
+    ///
+    /// See [`TextGenerationPipeline::generate`].
+    pub(super) fn execute_with(
+        &mut self,
+        prepared: PreparedInput,
+        control: &GenerationControl,
+    ) -> Result<(String, TokenUsage), CoreError> {
+        let control = control.limited_to(self.deadline_from_now());
+        self.generate_text(&prepared, &control)
     }
 
     fn deadline_from_now(&self) -> Option<Instant> {
@@ -799,8 +801,7 @@ impl TextGenerationPipeline {
         self.prompt.clone()
     }
 
-    /// Render and tokenize the prompt, shortening the user message when
-    /// the prompt is above the input cap.
+    /// Render and tokenize the prompt; see [`PromptBuilder::prepare`].
     fn prepare_prompt(&self, input: TextGenerationInput) -> Result<PreparedInput, CoreError> {
         self.prompt.prepare(input)
     }
@@ -809,14 +810,20 @@ impl TextGenerationPipeline {
     fn generate_text(
         &mut self,
         prepared: &PreparedInput,
-        deadline: Option<Instant>,
-    ) -> Result<String, CoreError> {
+        control: &GenerationControl,
+    ) -> Result<(String, TokenUsage), CoreError> {
         let max_new_tokens = self.settings.max_new_tokens;
-        let generated = self.generate(prepared, deadline, max_new_tokens, &mut |_| {})?;
-        self.prompt
+        let generated = self.generate(prepared, control, max_new_tokens, &mut |_| {})?;
+        let usage = TokenUsage {
+            prompt_tokens: prepared.sequence_length,
+            completion_tokens: generated.len(),
+        };
+        let text = self
+            .prompt
             .tokenizer
             .decode(&generated, true)
-            .map_err(|e| CoreError::Inference(e.to_string()))
+            .map_err(|e| CoreError::Inference(e.to_string()))?;
+        Ok((text, usage))
     }
 
     /// Greedily continue a prompt.
@@ -829,13 +836,13 @@ impl TextGenerationPipeline {
     /// # Errors
     ///
     /// Returns [`CoreError::InvalidInput`] for an empty prompt,
-    /// [`CoreError::Timeout`] if `deadline` passes, and
-    /// [`CoreError::Inference`] if the graph fails or returns a tensor of
-    /// an unexpected shape.
+    /// [`CoreError::Cancelled`] or [`CoreError::Timeout`] if `control`
+    /// stops the loop between two steps, and [`CoreError::Inference`] if
+    /// the graph fails or returns a tensor of an unexpected shape.
     fn generate(
         &mut self,
         prepared: &PreparedInput,
-        deadline: Option<Instant>,
+        control: &GenerationControl,
         max_new_tokens: usize,
         observe: &mut dyn FnMut(&[f32]),
     ) -> Result<Vec<u32>, CoreError> {
@@ -870,7 +877,7 @@ impl TextGenerationPipeline {
         let mut first_step = None;
 
         for step in 0..max_new_tokens {
-            ensure_before(deadline, step)?;
+            control.check("text generation", step)?;
             // With a cache, feed only what it does not cover yet (one
             // token after the first step). Without, feed everything.
             let fed_from = if kv_cache { cached_len } else { 0 };
@@ -969,12 +976,14 @@ impl TextGenerationPipeline {
 
         let generated = &tokens[prompt_len..];
         let prompt_elapsed = first_step.unwrap_or_default();
+        let elapsed = started.elapsed();
         tracing::debug!(
             prompt_tokens = prompt_len,
             generated_tokens = generated.len(),
             reached_token_limit = generated.len() == max_new_tokens,
             prompt_ms = prompt_elapsed.as_secs_f64() * 1000.0,
-            decode_ms = (started.elapsed() - prompt_elapsed).as_secs_f64() * 1000.0,
+            decode_ms = (elapsed - prompt_elapsed).as_secs_f64() * 1000.0,
+            tokens_per_second = tokens_per_second(generated.len(), elapsed),
             "text generation finished"
         );
 
@@ -989,43 +998,6 @@ impl TextGenerationPipeline {
     }
 }
 
-/// Cut the end off the user text so the prompt loses `excess` tokens.
-///
-/// `prompt` is the rendered prompt and `offsets` the byte span of each of
-/// its tokens. The user text is located in the prompt (its last
-/// occurrence: the user message comes after the system message), and the
-/// cut is made where the first surplus token of that text begins. Returns
-/// `None` when the text cannot be found in the prompt -- the template
-/// rewrote it -- or holds too few tokens to make up the excess.
-fn shorten_user_text(
-    prompt: &str,
-    offsets: &[(usize, usize)],
-    text: &str,
-    excess: usize,
-) -> Option<String> {
-    // A template may trim the message; look for the trimmed text then.
-    let (needle, start) = match prompt.rfind(text) {
-        Some(start) if !text.is_empty() => (text, start),
-        _ => {
-            let trimmed = text.trim();
-            (trimmed, prompt.rfind(trimmed).filter(|_| !trimmed.is_empty())?)
-        }
-    };
-    let end = start + needle.len();
-    let inside: Vec<usize> = offsets
-        .iter()
-        .filter(|(token_start, token_end)| *token_start >= start && *token_end <= end)
-        .map(|(token_start, _)| *token_start)
-        .collect();
-    // At least one token of the user text must remain.
-    let keep = inside.len().checked_sub(excess).filter(|keep| *keep > 0)?;
-    let mut cut = inside[keep] - start;
-    while !needle.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    Some(needle[..cut].to_string()).filter(|shortened| !shortened.is_empty())
-}
-
 impl Pipeline for TextGenerationPipeline {
     type Input = TextGenerationInput;
     type Prepared = PreparedInput;
@@ -1036,8 +1008,8 @@ impl Pipeline for TextGenerationPipeline {
     }
 
     fn execute(&mut self, prepared: PreparedInput) -> Result<String, CoreError> {
-        let deadline = self.deadline_from_now();
-        self.generate_text(&prepared, deadline)
+        self.execute_with(prepared, &GenerationControl::default())
+            .map(|(text, _usage)| text)
     }
 }
 
@@ -1299,55 +1271,6 @@ mod tests {
     }
 
     #[test]
-    fn user_text_is_cut_at_a_token_start() {
-        // Arrange -- prompt "<sys> hello brave new world <end>", one token
-        // per word; the user text spans tokens 1..=4.
-        let prompt = "<sys> hello brave new world <end>";
-        let offsets = [(0, 5), (6, 11), (12, 17), (18, 21), (22, 27), (28, 33)];
-        let text = "hello brave new world";
-
-        // Act / Assert
-        assert_eq!(
-            shorten_user_text(prompt, &offsets, text, 1).as_deref(),
-            Some("hello brave new ")
-        );
-        assert_eq!(shorten_user_text(prompt, &offsets, text, 3).as_deref(), Some("hello "));
-        // Nothing of the text would remain: not something to cut.
-        assert_eq!(shorten_user_text(prompt, &offsets, text, 4), None);
-        assert_eq!(shorten_user_text(prompt, &offsets, text, 9), None);
-    }
-
-    #[test]
-    fn user_text_is_found_after_an_equal_system_message_and_when_trimmed() {
-        // Arrange -- the same words as system and user message: the cut
-        // belongs to the later one. Offsets: one token per word.
-        let prompt = "a b | a b";
-        let offsets = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9)];
-
-        // Act / Assert
-        assert_eq!(shorten_user_text(prompt, &offsets, "a b", 1).as_deref(), Some("a "));
-        // A template that trims the message still allows the cut.
-        assert_eq!(shorten_user_text(prompt, &offsets, "  a b \n", 1).as_deref(), Some("a "));
-        // A template that rewrites the message does not.
-        assert_eq!(shorten_user_text(prompt, &offsets, "x y", 1), None);
-        assert_eq!(shorten_user_text(prompt, &offsets, "", 1), None);
-    }
-
-    #[test]
-    fn cut_never_splits_a_character() {
-        // Arrange -- byte-level tokens can start inside a multi-byte
-        // character: "é" is two bytes, split across tokens 1 and 2.
-        let prompt = "aé b";
-        let offsets = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)];
-
-        // Act
-        let shortened = shorten_user_text(prompt, &offsets, prompt, 3);
-
-        // Assert -- the cut moves back to the start of "é".
-        assert_eq!(shortened.as_deref(), Some("a"));
-    }
-
-    #[test]
     fn options_default_changes_nothing() {
         let options = TextGenerationOptions::new();
         assert_eq!(options, TextGenerationOptions::default());
@@ -1430,7 +1353,7 @@ mod tests {
             let mut cached_logits: Vec<Vec<f32>> = Vec::new();
             let started = Instant::now();
             let generated = cached
-                .generate(&prepared, None, max_new_tokens, &mut |logits| {
+                .generate(&prepared, &GenerationControl::default(), max_new_tokens, &mut |logits| {
                     if cached_logits.len() < uncached_steps {
                         cached_logits.push(logits.to_vec());
                     }
@@ -1442,7 +1365,7 @@ mod tests {
             let mut step = 0;
             let started = Instant::now();
             let without_cache = uncached
-                .generate(&prepared, None, steps, &mut |logits| {
+                .generate(&prepared, &GenerationControl::default(), steps, &mut |logits| {
                     for (a, b) in logits.iter().zip(&cached_logits[step]) {
                         max_logit_diff = max_logit_diff.max((a - b).abs());
                     }

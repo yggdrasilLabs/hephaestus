@@ -9,11 +9,14 @@
 //! expected text of every test is worked out by [`simulate`].
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use hephaestus_core::{
-    CoreError, ExecutionProvider, InferenceInput, Pipeline, PipelineKind, PipelineOutput,
-    Seq2SeqPipeline, TextGenerationInput, TextGenerationOptions, TextGenerationPipeline,
+    CoreError, ExecutionProvider, GenerationControl, InferenceInput, Pipeline, PipelineKind,
+    PipelineOutput, Seq2SeqPipeline, TextGenerationInput, TextGenerationOptions,
+    TextGenerationPipeline, TokenUsage,
 };
 use tempfile::TempDir;
 
@@ -341,47 +344,64 @@ fn batch_runs_every_request_in_order() {
 }
 
 #[test]
-fn long_user_text_is_cut_to_the_input_cap() {
-    // Arrange -- 40 words against a cap of 16 prompt tokens: the template
-    // takes 3 ("c", "d", "e"), so 13 words of the user text remain.
+fn prompt_above_the_input_cap_is_rejected_with_its_token_count() {
+    // Arrange -- 40 words against a cap of 16 prompt tokens; the template
+    // adds 3 ("c", "d", "e").
     let dir = model_dir(CACHED);
     let options = TextGenerationOptions::new()
         .with_max_input_tokens(16)
         .with_max_new_tokens(20);
-    let mut pipeline = load(&dir, &options);
+    let pipeline = load(&dir, &options);
     let user = ["a b c d e f g h i j"; 4].join(" ");
-    let kept = user.split(' ').take(13).collect::<Vec<_>>().join(" ");
 
     // Act
-    let text = generate(&mut pipeline, None, &user);
+    let result = pipeline.prepare(TextGenerationInput {
+        text: user,
+        system: None,
+    });
 
-    // Assert -- same as sending the first 13 words: the end of the
-    // template, where the reply starts, is intact.
-    assert_eq!(text, words(&simulate(&prompt(None, &kept), 20, 1.0, 0)));
+    // Assert -- nothing is cut: the request fails, naming both numbers.
+    let err = result.err().expect("oversized prompt should fail");
+    assert!(
+        matches!(err, CoreError::InputTooLong { tokens: 43, limit: 16 }),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "input too long: the prompt has 43 tokens, the limit is 16"
+    );
 }
 
 #[test]
-fn system_message_is_never_cut() {
-    // Arrange -- system message of 6 words; the template takes 5 with it,
-    // leaving 5 words of user text under a cap of 16.
+fn prompt_exactly_at_the_input_cap_is_generated_in_full() {
+    // Arrange -- system message of 6 words and user text of 5: with the 5
+    // template words that is exactly the cap of 16.
     let dir = model_dir(CACHED);
     let options = TextGenerationOptions::new()
         .with_max_input_tokens(16)
         .with_max_new_tokens(20);
     let mut pipeline = load(&dir, &options);
     let system = "l k j i h g";
-    let user = "a b c d e f g h i j";
+    let user = "a b c d e";
 
     // Act
     let text = generate(&mut pipeline, Some(system), user);
+    let one_more = pipeline.prepare(TextGenerationInput {
+        text: format!("{user} f"),
+        system: Some(system.to_string()),
+    });
 
     // Assert
-    let expected = simulate(&prompt(Some(system), "a b c d e"), 20, 1.0, 0);
+    let expected = simulate(&prompt(Some(system), user), 20, 1.0, 0);
     assert_eq!(text, words(&expected));
+    assert!(matches!(
+        one_more,
+        Err(CoreError::InputTooLong { tokens: 17, limit: 16 })
+    ));
 }
 
 #[test]
-fn prompt_that_cannot_fit_is_rejected() {
+fn system_message_counts_toward_the_input_cap() {
     // Arrange -- the system message alone fills the cap.
     let dir = model_dir(CACHED);
     let options = TextGenerationOptions::new().with_max_input_tokens(16);
@@ -396,7 +416,10 @@ fn prompt_that_cannot_fit_is_rejected() {
 
     // Assert
     let err = result.err().expect("oversized prompt should fail");
-    assert!(matches!(err, CoreError::InvalidInput(_)), "{err:?}");
+    assert!(
+        matches!(err, CoreError::InputTooLong { tokens: 27, limit: 16 }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -411,7 +434,7 @@ fn default_system_message_that_cannot_fit_fails_at_startup() {
     let result = TextGenerationPipeline::with_options(dir.path(), &ExecutionProvider::Cpu, &options);
 
     // Assert
-    assert!(matches!(result, Err(CoreError::InvalidInput(_))));
+    assert!(matches!(result, Err(CoreError::InputTooLong { limit: 16, .. })));
 }
 
 #[test]
@@ -493,6 +516,112 @@ fn expired_time_budget_stops_generation() {
 
     // Assert
     assert!(matches!(result, Err(CoreError::Timeout(_))));
+}
+
+#[test]
+fn cancelled_generation_stops_within_one_step() {
+    // Arrange -- a model that never stops by itself, cancelled once it
+    // has been asked five times whether to go on.
+    let mut config = base_config();
+    config.as_object_mut().expect("object").remove("eos_token_id");
+    let dir = model_dir_at(CACHED, "model.onnx", &config, None);
+    let options = TextGenerationOptions::new().with_max_new_tokens(200);
+    let mut pipeline = PipelineKind::TextGeneration(load(&dir, &options));
+    let prepared = pipeline.prepare("h i".to_string()).expect("prepare");
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&asked);
+    let control = GenerationControl::new()
+        .with_cancel_check(move || counter.fetch_add(1, Ordering::SeqCst) >= 5);
+
+    // Act
+    let result = pipeline.execute_with(prepared, &control);
+
+    // Assert -- five steps ran, the sixth was never started.
+    let err = result.err().expect("cancelled generation should fail");
+    assert!(matches!(err, CoreError::Cancelled(_)), "{err:?}");
+    assert!(err.to_string().contains("after 5 tokens"), "{err}");
+    assert_eq!(asked.load(Ordering::SeqCst), 6);
+}
+
+#[test]
+fn request_deadline_stops_generation_with_a_timeout() {
+    // Arrange -- no time budget on the pipeline; the request brings one.
+    let dir = model_dir(CACHED);
+    let mut pipeline = PipelineKind::TextGeneration(load(&dir, &TextGenerationOptions::new()));
+    let prepared = pipeline.prepare("h i".to_string()).expect("prepare");
+    let control = GenerationControl::new().with_deadline(Instant::now());
+
+    // Act
+    let result = pipeline.execute_with(prepared, &control);
+
+    // Assert
+    assert!(matches!(result, Err(CoreError::Timeout(_))));
+}
+
+#[test]
+fn execution_reports_prompt_and_generated_token_counts() {
+    // Arrange -- "c h i d e" reaches </s> after 5 words; see `simulate`.
+    let dir = model_dir(CACHED);
+    let full = simulate(&prompt(None, "h i"), 40, 1.0, 0);
+    let options = TextGenerationOptions::new().with_max_new_tokens(40);
+    let mut pipeline = PipelineKind::TextGeneration(load(&dir, &options));
+    let prepared = pipeline.prepare("h i".to_string()).expect("prepare");
+    let batch = vec![pipeline.prepare("h i".to_string()).expect("prepare")];
+
+    // Act
+    let single = pipeline
+        .execute_with(prepared, &GenerationControl::default())
+        .expect("execute");
+    let batched = pipeline
+        .execute_batch_with(batch, &[])
+        .pop()
+        .expect("one result")
+        .expect("execute");
+
+    // Assert -- the end token is generated, so it is counted.
+    let expected = TokenUsage {
+        prompt_tokens: 5,
+        completion_tokens: full.len(),
+    };
+    assert_eq!(single.usage, Some(expected));
+    assert_eq!(batched.usage, Some(expected));
+    assert_eq!(
+        single.to_json(),
+        serde_json::json!({
+            "generated_text": words(&full),
+            "prompt_tokens": 5,
+            "completion_tokens": full.len(),
+        })
+    );
+}
+
+#[test]
+fn cancelled_batch_item_does_not_stop_its_neighbours() {
+    // Arrange -- three requests; the second one's caller is gone.
+    let dir = model_dir(CACHED);
+    let options = TextGenerationOptions::new().with_max_new_tokens(40);
+    let mut pipeline = PipelineKind::TextGeneration(load(&dir, &options));
+    let batch = ["h i", "a b", "h i"]
+        .iter()
+        .map(|text| pipeline.prepare((*text).to_string()).expect("prepare"))
+        .collect();
+    let controls = [
+        GenerationControl::default(),
+        GenerationControl::new().with_cancel_check(|| true),
+        GenerationControl::default(),
+    ];
+
+    // Act
+    let results = pipeline.execute_batch_with(batch, &controls);
+
+    // Assert
+    let expected = words(&simulate(&prompt(None, "h i"), 40, 1.0, 0));
+    assert_eq!(results.len(), 3);
+    for index in [0, 2] {
+        let execution = results[index].as_ref().expect("neighbour should succeed");
+        assert_eq!(execution.to_json()["generated_text"], expected);
+    }
+    assert!(matches!(&results[1], Err(CoreError::Cancelled(_))));
 }
 
 #[test]

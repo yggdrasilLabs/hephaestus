@@ -3,6 +3,7 @@
 mod asr;
 mod chat_template;
 mod classifier;
+mod control;
 mod embeddings;
 mod encoder_decoder;
 mod preparer;
@@ -12,6 +13,7 @@ mod token_classifier;
 
 pub use asr::AsrPipeline;
 pub use classifier::ClassifierPipeline;
+pub use control::{Execution, GenerationControl, TokenUsage};
 pub use embeddings::EmbeddingsPipeline;
 pub use preparer::Preparer;
 pub use encoder_decoder::{SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS};
@@ -551,22 +553,55 @@ impl PipelineKind {
         &mut self,
         batch: Vec<PreparedData>,
     ) -> Vec<Result<PipelineOutput, CoreError>> {
-        if batch.is_empty() {
-            return Vec::new();
-        }
+        self.execute_batch_with(batch, &[])
+            .into_iter()
+            .map(|result| result.map(|execution| execution.output))
+            .collect()
+    }
 
+    /// [`PipelineKind::execute_batch`] with per-input limits and token
+    /// counts.
+    ///
+    /// `controls[i]` limits the generation of `batch[i]`; an input without
+    /// a control (a shorter or empty slice) is not limited. Only the
+    /// profiles that generate token by token read the controls and report
+    /// token counts; for every other profile this is `execute_batch`.
+    pub fn execute_batch_with(
+        &mut self,
+        batch: Vec<PreparedData>,
+        controls: &[GenerationControl],
+    ) -> Vec<Result<Execution, CoreError>> {
         // Encoder-decoder seq2seq generates token by token, so its inputs
-        // cannot share the single padded forward pass built below; that
-        // mode works through the batch itself. Every other pipeline,
-        // fused seq2seq included, continues unchanged.
+        // cannot share the single padded forward pass; that mode works
+        // through the batch itself. Every other pipeline, fused seq2seq
+        // included, continues unchanged.
         if let Self::Seq2Seq(p) = self
             && p.is_encoder_decoder()
         {
-            return p.execute_batch_sequential(batch);
+            return p.execute_batch_sequential(batch, controls);
         }
         // Text generation is token by token as well.
         if let Self::TextGeneration(p) = self {
-            return p.execute_batch_sequential(batch);
+            return p.execute_batch_sequential(batch, controls);
+        }
+        self.execute_batch_single_pass(batch)
+            .into_iter()
+            .map(|result| {
+                result.map(|output| Execution {
+                    output,
+                    usage: None,
+                })
+            })
+            .collect()
+    }
+
+    /// One padded forward pass over the whole batch (single-pass profiles).
+    fn execute_batch_single_pass(
+        &mut self,
+        batch: Vec<PreparedData>,
+    ) -> Vec<Result<PipelineOutput, CoreError>> {
+        if batch.is_empty() {
+            return Vec::new();
         }
 
         // Extract PreparedInput from each PreparedData::Text item.
@@ -736,6 +771,53 @@ impl PipelineKind {
     /// Accepts [`PreparedData`] and returns [`PipelineOutput`]. Callers
     /// convert to JSON via [`PipelineOutput::to_json()`] when needed.
     pub fn execute(
+        &mut self,
+        prepared: PreparedData,
+    ) -> Result<PipelineOutput, CoreError> {
+        self.execute_with(prepared, &GenerationControl::default())
+            .map(|execution| execution.output)
+    }
+
+    /// [`PipelineKind::execute`] with limits and token counts.
+    ///
+    /// `control` can stop a generation between token steps (deadline,
+    /// cancellation). Only the profiles that generate token by token read
+    /// it and report token counts; for every other profile this is
+    /// `execute` with `usage: None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `execute` returns, and [`CoreError::Cancelled`] or
+    /// [`CoreError::Timeout`] when `control` stopped the generation.
+    pub fn execute_with(
+        &mut self,
+        prepared: PreparedData,
+        control: &GenerationControl,
+    ) -> Result<Execution, CoreError> {
+        match (&mut *self, prepared) {
+            (Self::Seq2Seq(p), PreparedData::Text(t)) => {
+                let (text, usage) = p.execute_with(t, control)?;
+                Ok(Execution {
+                    output: PipelineOutput::Seq2Seq(text),
+                    usage,
+                })
+            }
+            (Self::TextGeneration(p), PreparedData::Text(t)) => {
+                let (text, usage) = p.execute_with(t, control)?;
+                Ok(Execution {
+                    output: PipelineOutput::TextGeneration(text),
+                    usage: Some(usage),
+                })
+            }
+            (pipeline, prepared) => Ok(Execution {
+                output: pipeline.execute_single_pass(prepared)?,
+                usage: None,
+            }),
+        }
+    }
+
+    /// Run a profile that has no token loop.
+    fn execute_single_pass(
         &mut self,
         prepared: PreparedData,
     ) -> Result<PipelineOutput, CoreError> {

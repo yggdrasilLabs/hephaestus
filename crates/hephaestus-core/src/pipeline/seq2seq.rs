@@ -9,10 +9,11 @@ use tokenizers::Tokenizer;
 use crate::ep::ExecutionProvider;
 use crate::error::CoreError;
 
+use super::control::{GenerationControl, TokenUsage};
 use super::encoder_decoder::{EncoderDecoder, EncoderDecoderFiles, SEQ2SEQ_MIN_INPUT_TOKENS};
 use super::{
     check_outputs_nonempty, load_session_and_tokenizer, resolve_onnx_path, run_onnx_inference,
-    tokenize_text, Pipeline, PipelineOutput, PreparedData, PreparedInput,
+    tokenize_text, Execution, Pipeline, PipelineOutput, PreparedData, PreparedInput,
 };
 
 /// Optional settings for [`Seq2SeqPipeline`].
@@ -215,11 +216,13 @@ impl Seq2SeqPipeline {
     /// Generation is token by token, so inputs cannot share one padded
     /// forward pass the way the other profiles do. Returns one result per
     /// input, in input order. The time budget covers the whole batch: its
-    /// requests arrived together, so they share a deadline.
+    /// requests arrived together, so they share a deadline. `controls[i]`,
+    /// when present, limits input `i` further.
     pub(super) fn execute_batch_sequential(
         &mut self,
         batch: Vec<PreparedData>,
-    ) -> Vec<Result<PipelineOutput, CoreError>> {
+        controls: &[GenerationControl],
+    ) -> Vec<Result<Execution, CoreError>> {
         let Some(decoder) = self.decoder.as_mut() else {
             return batch
                 .iter()
@@ -232,16 +235,26 @@ impl Seq2SeqPipeline {
                 .collect();
         };
         let deadline = decoder.deadline_from_now();
+        let unlimited = GenerationControl::default();
 
         batch
             .into_iter()
-            .map(|item| match item {
+            .enumerate()
+            .map(|(index, item)| match item {
                 PreparedData::Text(prepared) => {
-                    let ids = decoder.generate(&mut self.session, &prepared, deadline)?;
-                    self.tokenizer
+                    let control = controls.get(index).unwrap_or(&unlimited).limited_to(deadline);
+                    let ids = decoder.generate(&mut self.session, &prepared, &control)?;
+                    let text = self
+                        .tokenizer
                         .decode(&ids, true)
-                        .map(PipelineOutput::Seq2Seq)
-                        .map_err(|e| CoreError::Inference(e.to_string()))
+                        .map_err(|e| CoreError::Inference(e.to_string()))?;
+                    Ok(Execution {
+                        output: PipelineOutput::Seq2Seq(text),
+                        usage: Some(TokenUsage {
+                            prompt_tokens: prepared.sequence_length,
+                            completion_tokens: ids.len(),
+                        }),
+                    })
                 }
                 PreparedData::Audio(_) => Err(CoreError::InvalidInput(
                     "text pipeline received audio prepared data in batch".to_string(),
@@ -261,13 +274,40 @@ impl Pipeline for Seq2SeqPipeline {
     }
 
     fn execute(&mut self, prepared: PreparedInput) -> Result<String, CoreError> {
+        self.execute_with(prepared, &GenerationControl::default())
+            .map(|(text, _usage)| text)
+    }
+}
+
+impl Seq2SeqPipeline {
+    /// Run the model within `control`'s limits.
+    ///
+    /// In encoder-decoder mode `control` can stop the decode loop, and the
+    /// token counts of the generation are returned. A fused model runs a
+    /// single forward pass: it ignores `control` and counts nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`] if inference or decoding fails, and
+    /// [`CoreError::Cancelled`] or [`CoreError::Timeout`] when `control`
+    /// or the pipeline's own time budget stopped the generation.
+    pub(super) fn execute_with(
+        &mut self,
+        prepared: PreparedInput,
+        control: &GenerationControl,
+    ) -> Result<(String, Option<TokenUsage>), CoreError> {
         if let Some(decoder) = self.decoder.as_mut() {
-            let deadline = decoder.deadline_from_now();
-            let ids = decoder.generate(&mut self.session, &prepared, deadline)?;
-            return self
+            let control = control.limited_to(decoder.deadline_from_now());
+            let ids = decoder.generate(&mut self.session, &prepared, &control)?;
+            let usage = TokenUsage {
+                prompt_tokens: prepared.sequence_length,
+                completion_tokens: ids.len(),
+            };
+            let text = self
                 .tokenizer
                 .decode(&ids, true)
-                .map_err(|e| CoreError::Inference(e.to_string()));
+                .map_err(|e| CoreError::Inference(e.to_string()))?;
+            return Ok((text, Some(usage)));
         }
 
         let outputs = run_onnx_inference(&mut self.session, &prepared)?;
@@ -308,9 +348,11 @@ impl Pipeline for Seq2SeqPipeline {
             };
 
         // Decode token IDs back to text, skipping special tokens.
-        self.tokenizer
+        let text = self
+            .tokenizer
             .decode(&output_ids, true)
-            .map_err(|e| CoreError::Inference(e.to_string()))
+            .map_err(|e| CoreError::Inference(e.to_string()))?;
+        Ok((text, None))
     }
 }
 
@@ -608,7 +650,7 @@ mod tests {
             let decoder = pipeline.decoder.as_mut().expect("encoder-decoder mode");
             let started = std::time::Instant::now();
             let generated = decoder
-                .generate(&mut pipeline.session, &prepared, None)
+                .generate(&mut pipeline.session, &prepared, &GenerationControl::default())
                 .expect("generate");
             let elapsed = started.elapsed().as_secs_f64() * 1000.0;
             (generated.into_iter().map(i64::from).collect(), elapsed)
@@ -697,7 +739,7 @@ mod tests {
             let input_ids = prepared.input_ids.clone();
             let decoder = pipeline.decoder.as_mut().expect("encoder-decoder mode");
             let generated = decoder
-                .generate(&mut pipeline.session, &prepared, None)
+                .generate(&mut pipeline.session, &prepared, &GenerationControl::default())
                 .expect("generate");
             let text = pipeline.tokenizer.decode(&generated, true).expect("decode");
             println!(

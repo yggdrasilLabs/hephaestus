@@ -167,7 +167,7 @@ hephaestus/
 | **`INFERENCE_QUEUE_CAPACITY`** | `1024` | Most requests that may wait for the model at one time, 1-65536. One more is refused at once with HTTP 503, `Retry-After: 1` and error code `QUEUE_FULL` (gRPC `UNAVAILABLE`). The default is far above what a single-pass model queues under normal load; set a small value (for example `4`) for seq2seq and text generation models, where each waiting request takes seconds. Not applied with `BATCH_ENABLED=true`, where requests wait in the batcher's own bounded channel. |
 | **`SEQ2SEQ_MAX_INPUT_TOKENS`** | — | Seq2seq only. Input token cap, 8-16384; an encoder-decoder model also rejects a value above its `max_position_embeddings`. Unset: 512, as for every other profile. |
 | **`SEQ2SEQ_MAX_NEW_TOKENS`** | — | Seq2seq encoder-decoder models only. Most tokens generated per request, 1-4096. Unset: taken from the model's generation settings. |
-| **`TEXT_GENERATION_MAX_INPUT_TOKENS`** | — | Text generation only. Cap on prompt tokens (chat template, system message and user text together), 16-32768; startup fails if it plus the new-token limit exceeds the model's context. Unset: 4096, or less when the model's context minus the new-token limit is smaller. |
+| **`TEXT_GENERATION_MAX_INPUT_TOKENS`** | — | Text generation only. Cap on prompt tokens (chat template, system message and user text together), 16-32768; startup fails if it plus the new-token limit exceeds the model's context. Unset: 4096, or less when the model's context minus the new-token limit is smaller. A request above the cap is refused with HTTP 413; nothing is truncated. |
 | **`TEXT_GENERATION_MAX_NEW_TOKENS`** | — | Text generation only. Most tokens generated per request, 1-4096. Unset: `max_new_tokens` from `generation_config.json`, else 256. |
 | **`TEXT_GENERATION_SYSTEM_PROMPT`** | — | Text generation only. System message used when a request sends no `system` field. Unset: no system message. |
 | **`MODEL_ONNX_FILE`** | — | Text generation only. File name of the graph to serve instead of `model.onnx` (for example `model_q4.onnx`). Only that graph and its external data files are fetched. Startup fails if it is set for another profile. |
@@ -211,6 +211,8 @@ The token limit is always bounded: never more than 4096 and never more than the 
 
 The input cap stays at 512 tokens unless `SEQ2SEQ_MAX_INPUT_TOKENS` is set. Longer input is truncated, so raise it for long documents (for example `1024` for BART models).
 
+An encoder-decoder response also carries `prompt_tokens` (encoder input tokens, after truncation) and `completion_tokens` (generated tokens, the end token included). A fused model's response has neither.
+
 ```bash
 # A local Optimum export (encoder_model.onnx + decoder_model.onnx)
 MODEL_ID=philschmid/distilbart-cnn-12-6-samsum \
@@ -232,13 +234,14 @@ The `text_generation` profile serves instruction-tuned decoder-only models (Qwen
 curl -X POST http://localhost:8080/infer \
   -H "Content-Type: application/json" -H "x-tenant-id: <tenant>" \
   -d '{"text": "<call transcript>", "system": "Summarize the call in two sentences."}'
-# {"generated_text": "...", "latency_ms": 1234, "model_id": "..."}
+# {"generated_text": "...", "prompt_tokens": 412, "completion_tokens": 58, "latency_ms": 1234, "model_id": "..."}
 ```
 
 - `text` becomes the user message. `system` is optional: a string sets the system message for that request, `""` sends none, absent or `null` uses `TEXT_GENERATION_SYSTEM_PROMPT`. Any other JSON type is a 400. Every other profile ignores the field, whatever its type, like any unknown field.
 - The prompt is built with the model's own chat template: `chat_template.jinja` when the model has it, else `chat_template` in `tokenizer_config.json`. A model without a template does not start. Templates are rendered with minijinja with `add_generation_prompt=true` and no tools. Not supported: the `{% generation %}` tag (such a model fails at startup), tool definitions, and Python-exact `tojson` formatting.
 - Decoding is greedy, with the key/value cache when the graph has one (float32 cache tensors only; fp16 cache graphs are rejected at startup). It stops at any `eos_token_id` of `generation_config.json` (else `config.json`), at the new-token limit, or with HTTP 504 after `REQUEST_TIMEOUT_SECS`. `repetition_penalty` and `no_repeat_ngram_size` are applied. Sampling settings (`do_sample`, `temperature`, `top_p`, `top_k`), beams and streaming are not implemented.
-- A prompt above the input cap is shortened by cutting the end of the user text; the template and system message are kept. If they alone exceed the cap the request is a 400.
+- A prompt above the input cap (`TEXT_GENERATION_MAX_INPUT_TOKENS`) is refused with HTTP 413 and `{"error": {"code": "INPUT_TOO_LONG", "message": "input too long: the prompt has 5120 tokens, the limit is 4096"}}` (gRPC `INVALID_ARGUMENT`). The count covers the template, the system message and the user text. Nothing is truncated: shorten the text and send it again.
+- `prompt_tokens` and `completion_tokens` count the prompt as the model read it and the tokens it generated (the end token included).
 - One request generates at a time per replica; with `BATCH_ENABLED=true` the items of a batch run one after another. gRPC `Infer` works with the default system prompt only (the proto has no `system` field). Warmup generates one token; `WARMUP_INPUT` is not used.
 - The resolver additionally fetches `tokenizer_config.json`, `generation_config.json` and `chat_template.jinja` when `config.json` names a causal LM. With `MODEL_ONNX_FILE` set, only that graph is looked up (`onnx/` then the repository root); there is no fallback to another variant or to Forge.
 
@@ -311,6 +314,8 @@ One thread per replica runs the model, one job at a time. `/infer`, gRPC `Infer`
 - On SIGTERM the job that is running finishes; queued jobs and new requests get 503 `NOT_READY`.
 - With `BATCH_ENABLED=true` requests wait in the batcher's channel instead (4 × `BATCH_MAX_SIZE`, senders wait rather than being refused); each batch is one job.
 
+A request that times out or whose client disconnects while its generation is running (text generation, encoder-decoder seq2seq) stops that generation before the next token, so the next job starts at once. This holds for HTTP, gRPC and batched requests. A single forward pass (every other profile) cannot be interrupted and runs to its end.
+
 Metrics, all labelled `model_id`:
 
 | Metric | Type | Meaning |
@@ -319,6 +324,10 @@ Metrics, all labelled `model_id`:
 | `hephaestus_inference_queue_wait_seconds` | histogram | Time from admission to the start of the run |
 | `hephaestus_inference_jobs_rejected_total` | counter | Requests refused; `reason` is `queue_full` or `shutting_down` |
 | `hephaestus_inference_jobs_dropped_total` | counter | Queued requests that never ran; `reason` is `abandoned` (caller timed out or disconnected), `expired` (deadline passed, caller still waiting) or `shutdown` |
+| `hephaestus_inference_jobs_cancelled_total` | counter | Running generations stopped because the caller timed out or disconnected |
+| `hephaestus_prompt_tokens_total` | counter | Prompt tokens read by finished generations |
+| `hephaestus_generated_tokens_total` | counter | Tokens generated by finished generations |
+| `hephaestus_generation_tokens_per_second` | histogram | Generated tokens divided by the time of the whole run (prompt processing included), per finished generation |
 
 ### Kubernetes deployment (one model per pod)
 

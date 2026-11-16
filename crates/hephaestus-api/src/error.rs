@@ -11,6 +11,13 @@ use thiserror::Error;
 
 use crate::worker::QUEUE_FULL_RETRY_AFTER_SECS;
 
+/// 499, the de facto status for "the client closed the connection before
+/// the response" (nginx). Only ever written to logs and metrics.
+const CLIENT_CLOSED_REQUEST: StatusCode = match StatusCode::from_u16(499) {
+    Ok(status) => status,
+    Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+};
+
 /// Errors produced by the HTTP serving layer.
 ///
 /// Each variant maps to a specific HTTP status code and a machine-parseable
@@ -41,6 +48,21 @@ pub enum ApiError {
     #[error("inference queue full")]
     QueueFull,
 
+    /// The prompt has more tokens than the model accepts (maps to 413
+    /// Content Too Large).
+    #[error("input too long: the prompt has {tokens} tokens, the limit is {limit}")]
+    InputTooLong {
+        /// Tokens in the prompt, chat template and system message included.
+        tokens: usize,
+        /// The cap on prompt tokens (`TEXT_GENERATION_MAX_INPUT_TOKENS`).
+        limit: usize,
+    },
+
+    /// The caller went away and its generation was stopped (maps to 499,
+    /// which no client is left to read).
+    #[error("request cancelled")]
+    Cancelled,
+
     /// Client sent an invalid request (maps to 400 Bad Request).
     #[error("bad request: {0}")]
     BadRequest(String),
@@ -59,6 +81,8 @@ impl From<CoreError> for ApiError {
             CoreError::ModelLoad(msg) | CoreError::ModelValidation(msg) => Self::Model(msg),
             CoreError::Config(msg) => Self::Internal(msg),
             CoreError::Timeout(_) => Self::Timeout,
+            CoreError::Cancelled(_) => Self::Cancelled,
+            CoreError::InputTooLong { tokens, limit } => Self::InputTooLong { tokens, limit },
             CoreError::Io(e) => Self::Internal(e.to_string()),
             CoreError::JsonParse(e) => Self::Internal(e.to_string()),
         }
@@ -74,6 +98,8 @@ impl From<ApiError> for tonic::Status {
             // reads as a per-caller quota and is usually not retried.
             ApiError::QueueFull => tonic::Status::unavailable("inference queue full"),
             ApiError::BadRequest(msg) => tonic::Status::invalid_argument(msg),
+            ApiError::InputTooLong { .. } => tonic::Status::invalid_argument(err.to_string()),
+            ApiError::Cancelled => tonic::Status::cancelled("request cancelled"),
             ApiError::Tokenization(msg) => {
                 tonic::Status::invalid_argument(format!("tokenization failed: {msg}"))
             }
@@ -106,6 +132,13 @@ impl IntoResponse for ApiError {
             Self::NotReady => (StatusCode::SERVICE_UNAVAILABLE, "NOT_READY"),
             Self::QueueFull => (StatusCode::SERVICE_UNAVAILABLE, "QUEUE_FULL"),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
+            // 413, not 422: the request is well formed and would be served
+            // if it were shorter, which is what a client must do about it.
+            // The status alone tells it apart from a tokenization failure
+            // (422) and from a malformed request (400), and it is the
+            // status the body size limit of this server already uses.
+            Self::InputTooLong { .. } => (StatusCode::PAYLOAD_TOO_LARGE, "INPUT_TOO_LONG"),
+            Self::Cancelled => (CLIENT_CLOSED_REQUEST, "CANCELLED"),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
         };
 
@@ -213,6 +246,50 @@ mod tests {
         let status: tonic::Status = ApiError::QueueFull.into();
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert_eq!(status.message(), "inference queue full");
+    }
+
+    #[tokio::test]
+    async fn input_too_long_maps_to_413_naming_count_and_limit() {
+        // Arrange -- as the text generation pipeline reports it.
+        let err: ApiError = CoreError::InputTooLong {
+            tokens: 5120,
+            limit: 4096,
+        }
+        .into();
+
+        // Act
+        let response = err.into_response();
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "INPUT_TOO_LONG");
+        assert_eq!(
+            json["error"]["message"],
+            "input too long: the prompt has 5120 tokens, the limit is 4096"
+        );
+    }
+
+    #[test]
+    fn input_too_long_to_grpc_invalid_argument() {
+        let status: tonic::Status = ApiError::InputTooLong {
+            tokens: 5120,
+            limit: 4096,
+        }
+        .into();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("5120 tokens"), "{}", status.message());
+        assert!(status.message().contains("limit is 4096"), "{}", status.message());
+    }
+
+    #[tokio::test]
+    async fn cancelled_maps_to_499_and_grpc_cancelled() {
+        let err: ApiError = CoreError::Cancelled("after 3 tokens".to_string()).into();
+        assert!(matches!(err, ApiError::Cancelled));
+        assert_eq!(err.into_response().status().as_u16(), 499);
+        let status: tonic::Status = ApiError::Cancelled.into();
+        assert_eq!(status.code(), tonic::Code::Cancelled);
     }
 
     #[tokio::test]
