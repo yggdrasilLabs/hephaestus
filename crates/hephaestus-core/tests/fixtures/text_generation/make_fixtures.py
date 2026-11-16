@@ -69,6 +69,16 @@ and the logits at position ``t`` are ``8 - |v - target_t|`` for token
     row its column numbers instead of its own positions changes the
     output.
 
+``model_batch_absolute.onnx``
+    ``model_batch.onnx`` with absolute positions: ``total_i`` also adds
+    the column ``pos_i`` itself, and there is no ``position_ids`` input to
+    say otherwise. A row then gives the tokens it gives alone only when
+    it sits in the very columns it has alone, which no batch of rows of
+    different lengths can arrange: left padding shifts a short row, and
+    starting every row at column 0 puts the new token of a short row in
+    the column after the longest one. This is the graph that must not be
+    batched; the startup check has to find that out.
+
 ``tokenizer_config.json``
     A chat template made of words the tokenizer knows: a system message is
     wrapped as ``a ... b``, a user message as ``c ... d``, and the reply
@@ -219,7 +229,7 @@ def make_cached() -> None:
     _save(graph, "model.onnx")
 
 
-def make_batched(name: str, position_ids: bool) -> None:
+def make_batched(name: str, position_ids: bool, absolute: bool = False) -> None:
     """A cached graph whose batch rows are independent and masked per row."""
     nodes = [
         # Columns: the cache covers 0..past, this step past..total.
@@ -273,7 +283,7 @@ def make_batched(name: str, position_ids: bool) -> None:
         helper.make_node("Mul", ["term", "seen"], ["seen_term"]),
         helper.make_node("ReduceSum", ["seen_term", "axis2"], ["attended"], keepdims=0),
     ]
-    if position_ids:
+    if position_ids or absolute:
         nodes.append(helper.make_node("Add", ["attended", "query_positions"], ["checked"]))
     else:
         nodes.append(helper.make_node("Identity", ["attended"], ["checked"]))
@@ -350,4 +360,5 @@ if __name__ == "__main__":
     make_uncached()
     make_batched("model_batch.onnx", position_ids=False)
     make_batched("model_batch_positions.onnx", position_ids=True)
+    make_batched("model_batch_absolute.onnx", position_ids=False, absolute=True)
     make_tokenizer_config()
