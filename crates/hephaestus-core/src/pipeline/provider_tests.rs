@@ -704,10 +704,15 @@ fn gpu_generation_matches_cpu_on_a_real_model() {
         assert_eq!(
             gpu.max_batch(),
             width,
-            "{graph}: the graph must be able to batch"
+            "{graph}: the graph must be able to batch: {:?}",
+            gpu.batch_check()
         );
         let device = gpu.device.as_ref().map(|device| device.device().name());
         println!("{graph}: session on {provider}, cache on {device:?}");
+        println!(
+            "{graph}: startup check of batching: {:?}",
+            gpu.batch_check()
+        );
 
         // 3. Alone, against the CPU.
         let on_device = solo(&mut gpu, &prompts, max_new_tokens, logit_steps);

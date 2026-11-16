@@ -41,6 +41,10 @@ const HALF_PRECISION: [&str; 3] = [FLOAT16, FLOAT16_CACHE, FLOAT16_LOGITS];
 /// The whole-number graphs of `make_fixtures.py`: positions by column,
 /// and through `position_ids`. A wrong cache row changes their tokens.
 const WHOLE_NUMBERS: [&str; 2] = ["model_batch.onnx", "model_batch_positions.onnx"];
+/// Graphs shaped like an ONNX Runtime GenAI export (`make_tiny_gqa.py`),
+/// float32 and with a float16 cache: batch rows start at column 0, so
+/// joining and leaving also widens and cuts the cache.
+const FUSED_ATTENTION: [&str; 2] = ["tiny_gqa/model.onnx", "tiny_gqa/model_fp16.onnx"];
 
 /// User messages: prompts of 4 to 31 tokens.
 const USERS: [&str; 8] = [
@@ -92,8 +96,11 @@ fn model_dir(graph: &str) -> TempDir {
         "tokenizer_config.json",
     );
     copy("seq2seq/tokenizer.json", "tokenizer.json");
-    if graph.starts_with("tiny_qwen3/") {
-        copy("text_generation/tiny_qwen3/config.json", "config.json");
+    if let Some((model, _)) = graph.split_once('/') {
+        copy(
+            &format!("text_generation/{model}/config.json"),
+            "config.json",
+        );
     } else {
         let config = serde_json::json!({
             "architectures": ["LlamaForCausalLM"],
@@ -401,6 +408,7 @@ fn device_cache_picks_the_tokens_of_the_host_cache_for_one_request() {
         .into_iter()
         .chain([FLOAT32])
         .chain(HALF_PRECISION)
+        .chain(FUSED_ATTENTION)
     {
         // Arrange -- width 1: the single-request loop, both ways.
         let dir = model_dir(graph);
@@ -425,6 +433,7 @@ fn device_cache_picks_the_tokens_of_the_host_cache_in_a_batch() {
         .into_iter()
         .chain([FLOAT32])
         .chain(HALF_PRECISION)
+        .chain(FUSED_ATTENTION)
     {
         let dir = model_dir(graph);
         let expected = everyone_alone(&mut load(&dir, &options(1, false)));
@@ -464,6 +473,7 @@ fn device_cache_requests_join_and_leave_as_with_the_host_cache() {
         .into_iter()
         .chain([FLOAT32])
         .chain(HALF_PRECISION)
+        .chain(FUSED_ATTENTION)
     {
         let dir = model_dir(graph);
         let expected = everyone_alone(&mut load(&dir, &options(1, false)));

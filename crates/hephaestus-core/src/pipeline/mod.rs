@@ -24,7 +24,7 @@ pub use embeddings::EmbeddingsPipeline;
 pub use preparer::Preparer;
 pub use encoder_decoder::{SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS};
 pub use generation_batch::{
-    BatchProgress, FinishedGeneration, GenerationBatch, GenerationRequest,
+    BatchCheck, BatchProgress, FinishedGeneration, GenerationBatch, GenerationRequest, RowLayout,
 };
 pub use seq2seq::{Seq2SeqOptions, Seq2SeqPipeline};
 pub use text_generation::{

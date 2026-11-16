@@ -29,7 +29,7 @@ pub use pipeline::{
     SEQ2SEQ_MAX_NEW_TOKENS_LIMIT, SEQ2SEQ_MIN_INPUT_TOKENS,
 };
 pub use pipeline::{
-    BatchProgress, FinishedGeneration, GenerationBatch, GenerationRequest,
+    BatchCheck, BatchProgress, FinishedGeneration, GenerationBatch, GenerationRequest, RowLayout,
     TEXT_GENERATION_MAX_BATCH_LIMIT, TEXT_GENERATION_MAX_NEW_TOKENS_LIMIT,
     TEXT_GENERATION_MIN_INPUT_TOKENS, TextGenerationInput, TextGenerationOptions,
     TextGenerationPipeline,

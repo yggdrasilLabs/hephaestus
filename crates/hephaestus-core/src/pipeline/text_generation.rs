@@ -3,7 +3,10 @@
 //! Serves the Optimum export of a causal language model: one graph
 //! (`model.onnx`) that takes the tokens so far and returns next-token
 //! logits, plus, when exported with a key/value cache, `past_key_values.*`
-//! inputs and matching `present.*` outputs.
+//! inputs and matching `present.*` outputs. Exports of the ONNX Runtime
+//! GenAI model builder have the same inputs and outputs and are served
+//! the same way; they differ in how a batch must be laid out (see
+//! `generation_batch.rs`).
 //!
 //! A request is one user message and an optional system message. The
 //! model's own chat template turns them into the prompt; the prompt is
@@ -41,6 +44,7 @@ use super::encoder_decoder::{
     read_json, spec_names,
 };
 use super::float::{FloatType, float_tensor};
+use super::generation_batch::{BatchCheck, RowLayout};
 use super::{
     Execution, Pipeline, PipelineOutput, PreparedData, PreparedInput, build_onnx_session,
     resolve_onnx_path,
@@ -174,7 +178,10 @@ impl TextGenerationOptions {
     /// Above one, requests are decoded together and each still gets the
     /// tokens it would get alone (see `generation_batch.rs` for what that
     /// rests on). Needs a graph with a key/value cache and an
-    /// `attention_mask` input; without them the width stays one.
+    /// `attention_mask` input; without them the width stays one. It also
+    /// stays one, with an error in the log, if the check that runs when
+    /// the pipeline is built finds that batching changes the output on
+    /// this graph (`TextGenerationPipeline::batch_check`).
     pub fn with_max_batch(mut self, width: usize) -> Self {
         self.max_batch = Some(width);
         self
@@ -791,6 +798,10 @@ pub struct TextGenerationPipeline {
     /// Present when the cache stays on the session's device: forward
     /// passes then run through it instead of `Session::run`.
     pub(super) device: Option<DeviceRun>,
+    /// How the rows of a batch are laid out; found by the startup check.
+    pub(super) layout: RowLayout,
+    /// What the startup check of batched generation found.
+    pub(super) batch_check: BatchCheck,
 }
 
 impl TextGenerationPipeline {
@@ -882,6 +893,8 @@ impl TextGenerationPipeline {
             empty_past,
             max_batch,
             device,
+            layout: RowLayout::EndAligned,
+            batch_check: BatchCheck::NotNeeded,
         };
 
         // 4. The template must render what requests will send; a model
@@ -904,6 +917,12 @@ impl TextGenerationPipeline {
                 })?;
         }
 
+        // 6. Batching must give every request the tokens it gets alone.
+        //    Whether it does depends on how the graph reads its mask and
+        //    numbers positions, which its inputs do not tell: try it. A
+        //    graph that fails keeps running, one request at a time.
+        pipeline.check_batching();
+
         tracing::info!(
             model = %model_path.display(),
             kv_cache = pipeline.kv_cache,
@@ -922,6 +941,7 @@ impl TextGenerationPipeline {
             no_repeat_ngram_size = pipeline.settings.no_repeat_ngram_size,
             default_system_prompt = pipeline.prompt.system_prompt.is_some(),
             max_batch = pipeline.max_batch,
+            batch_check = ?pipeline.batch_check,
             "text generation pipeline loaded (greedy decoding)"
         );
         if pipeline.settings.eos_token_ids.is_empty() {

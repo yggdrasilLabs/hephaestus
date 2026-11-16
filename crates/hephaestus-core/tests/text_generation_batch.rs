@@ -16,7 +16,12 @@
 //! Those graphs compute in whole numbers. `tiny_qwen3/` is a real
 //! transformer with random weights (see `make_tiny_qwen3.py`): rotary
 //! positions counted by column, grouped-query attention, a float32 mask.
-//! The tests at the end run it batched against alone.
+//! `tiny_gqa/` (see `make_tiny_gqa.py`) has the structure of an ONNX
+//! Runtime GenAI export instead: its fused attention reads the mask only
+//! as a length, so its rows must start at column 0, not end together.
+//! The tests at the end run both batched against alone, and check that
+//! the pipeline finds out at startup which layout a graph can read -- or
+//! that it can read none (`model_batch_absolute.onnx`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,9 +29,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use hephaestus_core::{
-    BatchProgress, CoreError, ExecutionProvider, GenerationBatch, GenerationControl,
-    GenerationRequest, PipelineKind, PipelineOutput, PreparedData, TextGenerationOptions,
-    TextGenerationPipeline, TokenUsage,
+    BatchCheck, BatchProgress, CoreError, ExecutionProvider, GenerationBatch, GenerationControl,
+    GenerationRequest, PipelineKind, PipelineOutput, PreparedData, RowLayout,
+    TextGenerationOptions, TextGenerationPipeline, TokenUsage,
 };
 use tempfile::TempDir;
 
@@ -35,6 +40,9 @@ const BY_COLUMN: &str = "model_batch.onnx";
 /// Positions fed through `position_ids`.
 const BY_POSITION_IDS: &str = "model_batch_positions.onnx";
 const GRAPHS: [&str; 2] = [BY_COLUMN, BY_POSITION_IDS];
+/// Absolute positions counted by column: no batch of rows of different
+/// lengths reproduces what a row gets alone.
+const ABSOLUTE: &str = "model_batch_absolute.onnx";
 const EOS: i64 = 2;
 const MAX_NEW_TOKENS: usize = 40;
 
@@ -93,16 +101,31 @@ fn model_dir(graph: &str, generation_config: Option<&serde_json::Value>) -> Temp
     dir
 }
 
-/// A model directory around the tiny random Qwen3 export.
-fn qwen3_dir() -> TempDir {
+/// The tiny random transformers, as (fixture directory, graph file):
+/// the Optimum export of Qwen3, and a graph shaped like an ONNX Runtime
+/// GenAI export (fused `GroupQueryAttention`, see `make_tiny_gqa.py`) in
+/// float32 and with a float16 cache.
+const TRANSFORMERS: [(&str, &str); 3] = [
+    ("tiny_qwen3", "model.onnx"),
+    ("tiny_gqa", "model.onnx"),
+    ("tiny_gqa", "model_fp16.onnx"),
+];
+
+/// A model directory around one of [`TRANSFORMERS`].
+fn transformer_dir(model: &str, graph: &str) -> TempDir {
     let dir = tempfile::tempdir().expect("temp dir");
-    for (from, file) in [
-        ("text_generation/tiny_qwen3", "model.onnx"),
-        ("text_generation/tiny_qwen3", "config.json"),
-        ("text_generation", "tokenizer_config.json"),
-        ("seq2seq", "tokenizer.json"),
+    let model = format!("text_generation/{model}");
+    for (from, file, to) in [
+        (model.as_str(), graph, "model.onnx"),
+        (model.as_str(), "config.json", "config.json"),
+        (
+            "text_generation",
+            "tokenizer_config.json",
+            "tokenizer_config.json",
+        ),
+        ("seq2seq", "tokenizer.json", "tokenizer.json"),
     ] {
-        std::fs::copy(fixture(from, file), dir.path().join(file)).expect("copy fixture");
+        std::fs::copy(fixture(from, file), dir.path().join(to)).expect("copy fixture");
     }
     dir
 }
@@ -156,7 +179,7 @@ fn simulate(graph: &str, prompt: &[i64], max_new_tokens: usize) -> Vec<i64> {
             .zip(0_i64..)
             .map(|(token, position)| (token + 1) * (newest - position + 1))
             .sum();
-        if graph == BY_POSITION_IDS {
+        if graph == BY_POSITION_IDS || graph == ABSOLUTE {
             total += newest;
         }
         let next = if total % 13 == 0 { EOS } else { total % 12 + 4 };
@@ -906,56 +929,58 @@ fn qwen3_options(width: usize) -> TextGenerationOptions {
 
 #[test]
 fn real_transformer_gives_batched_requests_their_solo_tokens() {
-    // Arrange
-    let dir = qwen3_dir();
-    let mut solo = load(&dir, &qwen3_options(1));
-    let expected: Vec<Reply> = QWEN3_USERS
-        .iter()
-        .map(|user| alone(&mut solo, user))
-        .collect();
-    let mut distinct: Vec<&str> = expected.iter().map(|(text, _)| text.as_str()).collect();
-    distinct.sort_unstable();
-    distinct.dedup();
-    assert!(
-        distinct.len() >= 6,
-        "replies should depend on the prompt: {distinct:?}"
-    );
-    let mut by_length: Vec<usize> = (0..QWEN3_USERS.len()).collect();
-    by_length.sort_by_key(|&index| prompt(QWEN3_USERS[index]).len());
-    let orders: [Vec<usize>; 4] = [
-        (0..QWEN3_USERS.len()).collect(),
-        (0..QWEN3_USERS.len()).rev().collect(),
-        by_length.clone(),
-        by_length.into_iter().rev().collect(),
-    ];
-
-    for width in [2, 4, 8] {
-        let mut kind = load(&dir, &qwen3_options(width));
-        assert_eq!(
-            kind.generation_batch_width(),
-            width,
-            "no position_ids, but a cache and a mask"
+    for (model, graph) in TRANSFORMERS {
+        // Arrange
+        let dir = transformer_dir(model, graph);
+        let mut solo = load(&dir, &qwen3_options(1));
+        let expected: Vec<Reply> = QWEN3_USERS
+            .iter()
+            .map(|user| alone(&mut solo, user))
+            .collect();
+        let mut distinct: Vec<&str> = expected.iter().map(|(text, _)| text.as_str()).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() >= 6,
+            "{model}/{graph}: replies should depend on the prompt: {distinct:?}"
         );
-        for order in &orders {
-            let batch = order
-                .iter()
-                .map(|&index| {
-                    kind.prepare(QWEN3_USERS[index].to_string())
-                        .expect("prepare")
-                })
-                .collect();
+        let mut by_length: Vec<usize> = (0..QWEN3_USERS.len()).collect();
+        by_length.sort_by_key(|&index| prompt(QWEN3_USERS[index]).len());
+        let orders: [Vec<usize>; 4] = [
+            (0..QWEN3_USERS.len()).collect(),
+            (0..QWEN3_USERS.len()).rev().collect(),
+            by_length.clone(),
+            by_length.into_iter().rev().collect(),
+        ];
 
-            // Act
-            let results = kind.execute_batch_with(batch, &[]);
+        for width in [2, 4, 8] {
+            let mut kind = load(&dir, &qwen3_options(width));
+            assert_eq!(
+                kind.generation_batch_width(),
+                width,
+                "no position_ids, but a cache and a mask"
+            );
+            for order in &orders {
+                let batch = order
+                    .iter()
+                    .map(|&index| {
+                        kind.prepare(QWEN3_USERS[index].to_string())
+                            .expect("prepare")
+                    })
+                    .collect();
 
-            // Assert
-            for (result, &index) in results.into_iter().zip(order) {
-                let got = reply(result.expect("generation should succeed"));
-                assert_eq!(
-                    got, expected[index],
-                    "width {width}, order {order:?}: '{}'",
-                    QWEN3_USERS[index]
-                );
+                // Act
+                let results = kind.execute_batch_with(batch, &[]);
+
+                // Assert
+                for (result, &index) in results.into_iter().zip(order) {
+                    let got = reply(result.expect("generation should succeed"));
+                    assert_eq!(
+                        got, expected[index],
+                        "{model}/{graph}, width {width}, order {order:?}: '{}'",
+                        QWEN3_USERS[index]
+                    );
+                }
             }
         }
     }
@@ -963,63 +988,257 @@ fn real_transformer_gives_batched_requests_their_solo_tokens() {
 
 #[test]
 fn real_transformer_requests_join_and_leave_a_running_batch() {
-    // Arrange -- one request joins every three steps, as soon as it fits;
-    // one caller goes away after ten of its tokens.
-    let dir = qwen3_dir();
-    let mut solo = load(&dir, &qwen3_options(1));
-    let mut kind = load(&dir, &qwen3_options(4));
-    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counter = Arc::clone(&asked);
-    let leaves_early = GenerationControl::new()
-        .with_cancel_check(move || counter.fetch_add(1, Ordering::SeqCst) >= 10);
-    let cancelled: u64 = 2;
-    let mut waiting: std::collections::VecDeque<GenerationRequest> = (0_u64..)
-        .zip(QWEN3_USERS)
-        .map(|(id, user)| {
-            let control = if id == cancelled {
-                leaves_early.clone()
+    for (model, graph) in TRANSFORMERS {
+        // Arrange -- one request joins every three steps, as soon as it fits;
+        // one caller goes away after ten of its tokens.
+        let dir = transformer_dir(model, graph);
+        let mut solo = load(&dir, &qwen3_options(1));
+        let mut kind = load(&dir, &qwen3_options(4));
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let leaves_early = GenerationControl::new()
+            .with_cancel_check(move || counter.fetch_add(1, Ordering::SeqCst) >= 10);
+        let cancelled: u64 = 2;
+        let mut waiting: std::collections::VecDeque<GenerationRequest> = (0_u64..)
+            .zip(QWEN3_USERS)
+            .map(|(id, user)| {
+                let control = if id == cancelled {
+                    leaves_early.clone()
+                } else {
+                    GenerationControl::default()
+                };
+                request(&kind, id, user, control)
+            })
+            .collect();
+        let pipeline = generation(&mut kind);
+        let mut batch = GenerationBatch::new();
+        let mut finished = Finished::default();
+        let mut joined_running_batch = 0;
+        let mut steps_since_join = 3;
+
+        // Act
+        while !(waiting.is_empty() && batch.is_empty()) {
+            let due = batch.is_empty() || steps_since_join >= 3;
+            let fits = waiting
+                .front()
+                .is_some_and(|next| pipeline.admits(&batch, &[], prompt_tokens(&next.prepared)));
+            if due && fits {
+                joined_running_batch += usize::from(!batch.is_empty());
+                let next = waiting.pop_front().expect("a waiting request");
+                finished.record(pipeline.join(&mut batch, vec![next]));
+                steps_since_join = 0;
+            }
+            if !batch.is_empty() {
+                finished.record(pipeline.step(&mut batch));
+                steps_since_join += 1;
+            }
+        }
+
+        // Assert
+        assert!(
+            joined_running_batch >= 4,
+            "{model}/{graph}: {joined_running_batch} requests joined a running batch"
+        );
+        for (id, user) in (0_u64..).zip(QWEN3_USERS) {
+            if id == cancelled {
+                let error = finished.get(id).as_ref().expect_err("cancelled");
+                assert!(matches!(error, CoreError::Cancelled(_)), "{error:?}");
+                assert!(error.to_string().contains("after 10 tokens"), "{error}");
             } else {
-                GenerationControl::default()
-            };
-            request(&kind, id, user, control)
-        })
+                assert_eq!(
+                    finished.reply(id),
+                    &alone(&mut solo, user),
+                    "{model}/{graph}: '{user}'"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn startup_check_finds_the_layout_each_graph_can_read() {
+    // Arrange -- every graph that can batch, with the layout it needs.
+    let whole_numbers = GRAPHS.map(|graph| (model_dir(graph, None), graph, RowLayout::EndAligned));
+    let transformers = TRANSFORMERS.map(|(model, graph)| {
+        let layout = if model == "tiny_gqa" {
+            RowLayout::StartAligned
+        } else {
+            RowLayout::EndAligned
+        };
+        (transformer_dir(model, graph), graph, layout)
+    });
+
+    for (dir, graph, layout) in whole_numbers.iter().chain(&transformers) {
+        // Act
+        let mut batching = load(dir, &options(4));
+        let mut single = load(dir, &options(1));
+
+        // Assert
+        assert_eq!(
+            generation(&mut batching).batch_check(),
+            &BatchCheck::Passed(*layout),
+            "{graph}"
+        );
+        assert_eq!(batching.generation_batch_width(), 4, "{graph}");
+        // Nothing is checked, and nothing extra runs, at width one.
+        assert_eq!(
+            generation(&mut single).batch_check(),
+            &BatchCheck::NotNeeded,
+            "{graph}"
+        );
+    }
+}
+
+#[test]
+fn graph_that_no_layout_can_batch_is_served_one_request_at_a_time() {
+    // Arrange -- absolute positions by column: a row is only right in the
+    // columns it has alone.
+    let dir = model_dir(ABSOLUTE, None);
+    let mut solo = load(&dir, &options(1));
+
+    // Act -- a width of four is asked for.
+    let mut kind = load(&dir, &options(4));
+
+    // Assert -- startup succeeds, the check says why, the width is one...
+    let BatchCheck::Failed(detail) = generation(&mut kind).batch_check().clone() else {
+        panic!(
+            "the check should fail: {:?}",
+            generation(&mut kind).batch_check()
+        );
+    };
+    assert!(detail.contains("EndAligned: request"), "{detail}");
+    assert!(detail.contains("StartAligned: request"), "{detail}");
+    assert!(detail.contains("logits differ"), "{detail}");
+    assert_eq!(kind.generation_batch_width(), 1);
+    // ...and every request still gets its solo reply.
+    let batch = USERS
+        .iter()
+        .map(|user| kind.prepare((*user).to_string()).expect("prepare"))
         .collect();
+    let results = kind.execute_batch_with(batch, &[]);
+    for (result, user) in results.into_iter().zip(USERS) {
+        let got = reply(result.expect("generation should succeed"));
+        assert_eq!(
+            got.0,
+            words(&simulate(ABSOLUTE, &prompt(user), MAX_NEW_TOKENS))
+        );
+        assert_eq!(got, alone(&mut solo, user), "'{user}'");
+    }
+    let pipeline = generation(&mut kind);
+    let mut batch = GenerationBatch::new();
+    let first = request_of(pipeline, 0, "b b");
+    pipeline.join(&mut batch, vec![first]);
+    assert!(
+        !pipeline.admits(&batch, &[], 4),
+        "nothing joins at width one"
+    );
+}
+
+/// A request for `user` with no limits of its own.
+fn request_of(pipeline: &TextGenerationPipeline, id: u64, user: &str) -> GenerationRequest {
+    use hephaestus_core::Pipeline;
+    GenerationRequest {
+        id,
+        prepared: PreparedData::Text(
+            pipeline
+                .prepare(hephaestus_core::TextGenerationInput::from(user.to_string()))
+                .expect("prepare"),
+        ),
+        control: GenerationControl::default(),
+    }
+}
+
+#[test]
+fn rows_that_start_at_column_zero_take_any_prompt_and_are_cut_back() {
+    for graph in ["model.onnx", "model_fp16.onnx"] {
+        // Arrange -- a 6-token prompt that runs long, and a 31-token one
+        // whose caller goes away after three tokens.
+        let dir = transformer_dir("tiny_gqa", graph);
+        let mut solo = load(&dir, &qwen3_options(1));
+        let mut kind = load(&dir, &qwen3_options(4));
+        let short = request(&kind, 0, "f g a", GenerationControl::default());
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let long = request(
+            &kind,
+            1,
+            QWEN3_USERS[6],
+            GenerationControl::new()
+                .with_cancel_check(move || counter.fetch_add(1, Ordering::SeqCst) >= 3),
+        );
+        let late = request(&kind, 2, "h i", GenerationControl::default());
+        assert_eq!(prompt_tokens(&short.prepared), 6);
+        assert_eq!(prompt_tokens(&long.prepared), 31);
+        let pipeline = generation(&mut kind);
+        let mut batch = GenerationBatch::new();
+        let mut finished = Finished::default();
+
+        // Act / Assert -- the batch is as wide as its longest row.
+        finished.record(pipeline.join(&mut batch, vec![short]));
+        finished.record(pipeline.step(&mut batch));
+        assert_eq!((batch.len(), batch.columns()), (1, 7), "{graph}");
+        // A prompt far longer than the batch is wide joins at once.
+        assert!(pipeline.admits(&batch, &[], 31), "{graph}");
+        let progress = pipeline.join(&mut batch, vec![long]);
+        assert_eq!(progress.rows, 1, "{graph}: only the new prompt is read");
+        finished.record(progress);
+        assert_eq!((batch.len(), batch.columns()), (2, 31), "{graph}");
+        for _ in 0..2 {
+            finished.record(pipeline.step(&mut batch));
+        }
+        assert_eq!((batch.len(), batch.columns()), (2, 33), "{graph}");
+        // The long row leaves: the batch is cut back to the short one,
+        // whose cache holds its 6 prompt tokens and 4 generated ones
+        // once the step is done.
+        let left = finished.record(pipeline.step(&mut batch));
+        assert_eq!(left, vec![1], "{graph}");
+        assert_eq!((batch.len(), batch.columns()), (1, 10), "{graph}");
+        // A shorter prompt joins the row that is left.
+        finished.record(pipeline.join(&mut batch, vec![late]));
+        assert_eq!((batch.len(), batch.columns()), (2, 10), "{graph}");
+        drain(pipeline, &mut batch, &mut finished);
+
+        // Assert
+        assert!(matches!(finished.get(1), Err(CoreError::Cancelled(_))));
+        assert_eq!(finished.reply(0), &alone(&mut solo, "f g a"), "{graph}");
+        assert_eq!(finished.reply(2), &alone(&mut solo, "h i"), "{graph}");
+        assert_eq!(batch.columns(), 0, "{graph}");
+    }
+}
+
+#[test]
+fn rows_that_start_at_column_zero_join_together_in_any_number() {
+    // Arrange -- five requests start in one call, three more join a batch
+    // that is running; each prompt is read alone.
+    let dir = transformer_dir("tiny_gqa", "model.onnx");
+    let mut solo = load(&dir, &qwen3_options(1));
+    let mut kind = load(&dir, &qwen3_options(8));
+    let requests: Vec<GenerationRequest> = (0_u64..)
+        .zip(QWEN3_USERS)
+        .map(|(id, user)| request(&kind, id, user, GenerationControl::default()))
+        .collect();
+    let prompts: Vec<usize> = requests
+        .iter()
+        .map(|request| prompt_tokens(&request.prepared))
+        .collect();
+    let mut requests = requests.into_iter();
     let pipeline = generation(&mut kind);
     let mut batch = GenerationBatch::new();
     let mut finished = Finished::default();
-    let mut joined_running_batch = 0;
-    let mut steps_since_join = 3;
 
     // Act
-    while !(waiting.is_empty() && batch.is_empty()) {
-        let due = batch.is_empty() || steps_since_join >= 3;
-        let fits = waiting
-            .front()
-            .is_some_and(|next| pipeline.admits(&batch, &[], prompt_tokens(&next.prepared)));
-        if due && fits {
-            joined_running_batch += usize::from(!batch.is_empty());
-            let next = waiting.pop_front().expect("a waiting request");
-            finished.record(pipeline.join(&mut batch, vec![next]));
-            steps_since_join = 0;
-        }
-        if !batch.is_empty() {
-            finished.record(pipeline.step(&mut batch));
-            steps_since_join += 1;
-        }
-    }
+    assert!(pipeline.admits(&batch, &prompts[..4], prompts[4]));
+    let progress = pipeline.join(&mut batch, requests.by_ref().take(5).collect());
+    assert_eq!(progress.rows, 5);
+    finished.record(progress);
+    finished.record(pipeline.step(&mut batch));
+    let progress = pipeline.join(&mut batch, requests.collect());
+    assert_eq!(progress.rows, 3);
+    finished.record(progress);
+    drain(pipeline, &mut batch, &mut finished);
 
     // Assert
-    assert!(
-        joined_running_batch >= 4,
-        "{joined_running_batch} requests joined a running batch"
-    );
     for (id, user) in (0_u64..).zip(QWEN3_USERS) {
-        if id == cancelled {
-            let error = finished.get(id).as_ref().expect_err("cancelled");
-            assert!(matches!(error, CoreError::Cancelled(_)), "{error:?}");
-            assert!(error.to_string().contains("after 10 tokens"), "{error}");
-        } else {
-            assert_eq!(finished.reply(id), &alone(&mut solo, user), "'{user}'");
-        }
+        assert_eq!(finished.reply(id), &alone(&mut solo, user), "'{user}'");
     }
 }

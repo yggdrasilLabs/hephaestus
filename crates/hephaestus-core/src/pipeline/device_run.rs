@@ -23,7 +23,9 @@
 //!   (`Concat` of two caches, `Gather` of rows, `Where` to zero padding):
 //!   see [`DeviceRun::gather_rows`]. The moved cache is written into
 //!   memory of the model session's own arena, so the helper session
-//!   holds no cache memory of its own.
+//!   holds no cache memory of its own. Caches of different widths are
+//!   first brought to one width ([`DeviceRun::gather_columns`], a
+//!   `Gather` on the column axis; built when first needed).
 //!
 //! The device is whatever the execution provider computes on. With the
 //! CPU provider it is host memory and everything above runs the same
@@ -320,6 +322,30 @@ impl Helper {
             .map_err(|e| failed(&e))?;
         Self::new("cache-rows", graph, ep)
     }
+
+    /// `out = Gather(a, columns, axis = 2)`: chosen columns of a cache.
+    fn cache_columns(cache: FloatType, ep: &ExecutionProvider) -> Result<Self, CoreError> {
+        let failed = |e: &dyn std::fmt::Display| load("cannot build the cache-columns graph", e);
+        let mut graph = Graph::new().map_err(|e| failed(&e))?;
+        graph
+            .set_inputs([
+                outlet("a", cache.element_type(), 4),
+                outlet("columns", TensorElementType::Int64, 1),
+            ])
+            .map_err(|e| failed(&e))?;
+        graph
+            .set_outputs([outlet("out", cache.element_type(), 4)])
+            .map_err(|e| failed(&e))?;
+        graph
+            .add_node(node(
+                "Gather",
+                &["a", "columns"],
+                "out",
+                vec![attribute("axis", 2)?],
+            )?)
+            .map_err(|e| failed(&e))?;
+        Self::new("cache-columns", graph, ep)
+    }
 }
 
 /// Runs a text generation graph with its cache kept on the device; see
@@ -333,6 +359,10 @@ pub(super) struct DeviceRun {
     device: ComputeDevice,
     last: Helper,
     rows: Helper,
+    /// Built by the first [`gather_columns`](Self::gather_columns).
+    columns: Option<Helper>,
+    /// The provider the helper graphs are built for.
+    ep: ExecutionProvider,
     /// Whether a forward pass has shown the cache to be on `device`.
     verified: bool,
 }
@@ -361,6 +391,8 @@ impl DeviceRun {
             device,
             last: Helper::last_position(logits, ep)?,
             rows: Helper::cache_rows(cache, ep)?,
+            columns: None,
+            ep: *ep,
             verified: false,
         })
     }
@@ -548,6 +580,73 @@ impl DeviceRun {
         binding.clear();
         let moved = result.map_err(|e| failed(&e))?.ok_or_else(|| {
             CoreError::Inference("the cache-rows graph returned nothing".to_string())
+        })?;
+        Ok((moved, allocator))
+    }
+}
+
+impl DeviceRun {
+    /// A cache tensor at another width, as a new tensor on the device:
+    /// the first `columns` columns of `a`, which has `source` of them.
+    /// Where `a` has no such column the entry is unspecified (a copy of
+    /// the last column); the caller zeroes it
+    /// ([`gather_rows`](Self::gather_rows)).
+    ///
+    /// Like `gather_rows`, the result is allocated from the model
+    /// session's arena and the returned handle must be kept for as long
+    /// as the tensor is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Inference`] if `a` is not a tensor of four
+    /// dimensions with at least one column, or the cache-columns graph
+    /// cannot be built on the device or fails.
+    pub(super) fn gather_columns(
+        &mut self,
+        a: &DynValue,
+        source: usize,
+        columns: usize,
+    ) -> Result<(DynValue, Arc<DeviceAllocator>), CoreError> {
+        let &[rows, heads, _, head_dim] = &a.shape()[..] else {
+            return Err(CoreError::Inference(format!(
+                "cache tensor has shape {:?}, expected (rows, heads, columns, head_dim)",
+                a.shape(),
+            )));
+        };
+        let Some(last) = source.checked_sub(1) else {
+            return Err(CoreError::Inference(
+                "cannot widen a key/value cache without columns".to_string(),
+            ));
+        };
+        let picked: Vec<i64> = (0..columns).map(|column| column.min(last) as i64).collect();
+        let dims = [rows, heads, columns as i64, head_dim];
+        let shrink = self.device.arena_to_shrink();
+        let element_type = self.cache_type.element_type();
+        let allocator = Arc::clone(&self.allocator);
+        let helper = match &mut self.columns {
+            Some(helper) => helper,
+            empty => empty.insert(
+                Helper::cache_columns(self.cache_type, &self.ep)
+                    .map_err(|e| CoreError::Inference(e.to_string()))?,
+            ),
+        };
+        let Helper { session, binding } = helper;
+        let binding = binding.get();
+        let failed = |e: &ort::Error| inference("cannot move key/value cache columns", e);
+        binding.clear();
+        let result = (|| {
+            let mut options = RunOptions::new()?;
+            options.set("memory.enable_memory_arena_shrinkage", shrink.as_str())?;
+            let columns_tensor = TensorRef::from_array_view(([picked.len()], picked.as_slice()))?;
+            binding.bind_input("a", a)?;
+            binding.bind_input("columns", &columns_tensor)?;
+            binding.bind_output("out", allocator.tensor(element_type, &dims)?)?;
+            let mut outputs = session.run_binding_with_options(binding, &options)?;
+            Ok::<_, ort::Error>(outputs.remove("out"))
+        })();
+        binding.clear();
+        let moved = result.map_err(|e| failed(&e))?.ok_or_else(|| {
+            CoreError::Inference("the cache-columns graph returned nothing".to_string())
         })?;
         Ok((moved, allocator))
     }

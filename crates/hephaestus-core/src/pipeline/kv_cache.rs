@@ -11,10 +11,13 @@
 //! - a cache in host memory is copied by the host, as `float32` or
 //!   `float16`;
 //! - a cache on the session's device is copied there, by the cache-rows
-//!   graph of [`DeviceRun`]. The host sends row numbers and a mask and
-//!   never sees the tensors.
+//!   and cache-columns graphs of [`DeviceRun`]. The host sends row and
+//!   column numbers and a mask and never sees the tensors.
 //!
-//! Both produce the same values: rows are copied, nothing is computed.
+//! Both produce the same values: entries are copied or zeroed, nothing is
+//! computed. A row stays in its columns; the gathered cache may have more
+//! columns than a source (zeros are added on the right) or fewer (the
+//! right-most are dropped).
 
 use std::fmt::Debug;
 
@@ -38,14 +41,20 @@ pub(super) enum CacheHome<'a> {
 }
 
 /// One row to copy into a gathered cache.
+///
+/// Columns `from..to` of the row are copied, as far as the source and the
+/// gathered cache reach; every other entry of the gathered row is zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RowPick {
     /// Row of the source cache.
     pub(super) row: usize,
-    /// Leading columns to write as zeros instead of copying: the row's
-    /// padding, whose cache entries are whatever the graph computed for
-    /// padding tokens.
-    pub(super) zero_columns: usize,
+    /// First column that is copied. The columns before it are the row's
+    /// padding in a layout that pads on the left: their cache entries are
+    /// whatever the graph computed for padding tokens.
+    pub(super) from: usize,
+    /// End of the columns that are copied. From there on the source holds
+    /// nothing of the row in a layout whose rows start at column 0.
+    pub(super) to: usize,
 }
 
 impl RowPick {
@@ -53,8 +62,43 @@ impl RowPick {
     pub(super) fn copy(row: usize) -> Self {
         Self {
             row,
-            zero_columns: 0,
+            from: 0,
+            to: usize::MAX,
         }
+    }
+
+    /// The row without its first `padding` columns.
+    pub(super) fn after_padding(row: usize, padding: usize) -> Self {
+        Self {
+            row,
+            from: padding,
+            to: usize::MAX,
+        }
+    }
+
+    /// The first `length` columns of the row.
+    pub(super) fn first(row: usize, length: usize) -> Self {
+        Self {
+            row,
+            from: 0,
+            to: length,
+        }
+    }
+
+    /// The columns to copy from a source `source` columns wide into a
+    /// cache `columns` wide; empty as `(0, 0)`.
+    fn range(self, source: usize, columns: usize) -> (usize, usize) {
+        let to = self.to.min(source).min(columns);
+        if self.from < to {
+            (self.from, to)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Whether the pick copies all of a row `columns` wide.
+    pub(super) fn is_whole(self, columns: usize) -> bool {
+        self.from == 0 && self.to >= columns
     }
 }
 
@@ -143,28 +187,34 @@ impl KvCache {
         self.rows
     }
 
+    /// Positions per sequence.
+    pub(super) fn columns(&self) -> usize {
+        self.columns
+    }
+
     /// The tensors to feed, in slot order.
     pub(super) fn tensors(&self) -> &[DynValue] {
         &self.tensors
     }
 
-    /// A new cache made of chosen rows of caches that cover the same
-    /// columns, in the order given. The caches live in `home`, and so
-    /// does the result.
+    /// A new cache `columns` wide made of chosen rows of other caches,
+    /// in the order given. The caches live in `home`, and so does the
+    /// result.
     ///
     /// This is the only place a generation's cache moves: to another row
-    /// when a neighbour leaves, or next to others when it joins. Columns
-    /// never move.
+    /// when a neighbour leaves, or next to others when it joins. An entry
+    /// never moves to another column: a source narrower than `columns`
+    /// gets zeros on the right, a wider one loses its right-most columns.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::Inference`] if `parts` picks no row, the
-    /// caches differ in shape, a pick is out of range, a host tensor is
-    /// not of `home`'s float type and of shape `(rows, heads, columns,
-    /// head_dim)`, or (on a device) more than two caches are given or the
-    /// cache-rows graph fails.
+    /// caches differ in their tensors, a pick is out of range, a host
+    /// tensor is not of `home`'s float type and of shape `(rows, heads,
+    /// columns, head_dim)`, or (on a device) a helper graph fails.
     pub(super) fn gather(
         parts: &[(&KvCache, &[RowPick])],
+        columns: usize,
         home: CacheHome<'_>,
     ) -> Result<Self, CoreError> {
         let rows: usize = parts.iter().map(|(_, picks)| picks.len()).sum();
@@ -178,7 +228,6 @@ impl KvCache {
                 "cannot gather a key/value cache of no rows".to_string(),
             ));
         };
-        let columns = first.columns;
         let slots = first.tensors.len();
         for (cache, picks) in &parts {
             if cache.tensors.len() != slots {
@@ -186,20 +235,10 @@ impl KvCache {
                     "key/value caches differ in their tensors".to_string(),
                 ));
             }
-            if cache.columns != columns {
+            if let Some(pick) = picks.iter().find(|pick| pick.row >= cache.rows) {
                 return Err(CoreError::Inference(format!(
-                    "cannot gather caches of {} and {columns} columns",
-                    cache.columns,
-                )));
-            }
-            if let Some(pick) = picks
-                .iter()
-                .find(|pick| pick.row >= cache.rows || pick.zero_columns > columns)
-            {
-                return Err(CoreError::Inference(format!(
-                    "cache row {} with {} padded columns is outside a cache of {} rows \
-                     and {columns} columns",
-                    pick.row, pick.zero_columns, cache.rows,
+                    "cache row {} is outside a cache of {} rows",
+                    pick.row, cache.rows,
                 )));
             }
         }
@@ -250,25 +289,25 @@ where
                 )));
             };
             if *source_rows != cache.rows
-                || *source_columns != columns
+                || *source_columns != cache.columns
                 || *heads_and_size.get_or_insert((*heads, *head_dim)) != (*heads, *head_dim)
             {
                 return Err(CoreError::Inference(format!(
-                    "cache tensor has shape {shape:?}, expected {} rows and {columns} columns",
-                    cache.rows,
+                    "cache tensor has shape {shape:?}, expected {} rows and {} columns",
+                    cache.rows, cache.columns,
                 )));
             }
+            let source_head_len = source_columns * head_dim;
             let head_len = columns * head_dim;
-            let row_len = heads * head_len;
-            gathered.reserve(picks.len() * row_len);
             for pick in *picks {
                 let start = gathered.len();
-                gathered.extend_from_slice(&data[pick.row * row_len..(pick.row + 1) * row_len]);
-                if pick.zero_columns > 0 {
-                    for head in 0..*heads {
-                        let from = start + head * head_len;
-                        gathered[from..from + pick.zero_columns * head_dim].fill(T::default());
-                    }
+                gathered.resize(start + heads * head_len, T::default());
+                let (from, to) = pick.range(*source_columns, columns);
+                for head in 0..*heads {
+                    let source = (pick.row * heads + head) * source_head_len;
+                    let target = start + head * head_len;
+                    gathered[target + from * head_dim..target + to * head_dim]
+                        .copy_from_slice(&data[source + from * head_dim..source + to * head_dim]);
                 }
             }
         }
@@ -286,48 +325,97 @@ where
 
 /// [`KvCache::gather`] for tensors on the device of `device`. `parts`
 /// has been checked: no empty part, picks in range.
+///
+/// A source that is not `columns` wide is first copied to that width
+/// (cache-columns graph). The cache-rows graph then takes two caches at a
+/// time, so more than two are merged one after another.
 fn gather_on_device(
     parts: &[(&KvCache, &[RowPick])],
     columns: usize,
     device: &mut DeviceRun,
 ) -> Result<(Vec<DynValue>, Option<Arc<DeviceAllocator>>), CoreError> {
-    let (first, second) = match parts {
-        [first] => (first, None),
-        [first, second] => (first, Some(second)),
-        _ => {
-            return Err(CoreError::Inference(format!(
-                "cannot gather {} key/value caches on a device at once",
-                parts.len(),
-            )));
+    // Which entries of a gathered row are copied, not zero.
+    let keep_of = |cache: &KvCache, picks: &[RowPick], keep: &mut Vec<bool>| {
+        for pick in picks {
+            let (from, to) = pick.range(cache.columns, columns);
+            keep.extend((0..columns).map(|column| from <= column && column < to));
         }
     };
-    // Rows of the second cache follow those of the first.
-    let mut rows = Vec::new();
-    let mut keep = Vec::new();
-    for (offset, (_, picks)) in [(0, first)]
-        .into_iter()
-        .chain(second.map(|second| (first.0.rows, second)))
-    {
-        for pick in *picks {
-            rows.push(i64::try_from(offset + pick.row).map_err(|_| {
-                CoreError::Inference(format!("cache row {} does not fit an index", pick.row))
-            })?);
-            keep.extend(std::iter::repeat_n(false, pick.zero_columns));
-            keep.extend(std::iter::repeat_n(true, columns - pick.zero_columns));
-        }
-    }
-    let mut tensors = Vec::with_capacity(first.0.tensors.len());
+    let index = |row: usize| {
+        i64::try_from(row)
+            .map_err(|_| CoreError::Inference(format!("cache row {row} does not fit an index")))
+    };
+    let slots = parts.first().map_or(0, |(cache, _)| cache.tensors.len());
+    let mut tensors = Vec::with_capacity(slots);
     let mut allocator = None;
-    for slot in 0..first.0.tensors.len() {
-        let (tensor, owner) = device.gather_rows(
-            &first.0.tensors[slot],
-            second.map(|(cache, _)| &cache.tensors[slot]),
-            &rows,
-            &keep,
-            columns,
-        )?;
-        tensors.push(tensor);
-        allocator = Some(owner);
+    for slot in 0..slots {
+        // The rows gathered so far, on the device.
+        let mut merged: Option<(DynValue, Arc<DeviceAllocator>, usize)> = None;
+        let mut rest = parts.iter();
+        while let Some((cache, picks)) = rest.next() {
+            // The source at the width of the result; its columns beyond
+            // the source's own are zeroed through `keep`.
+            let widened = if cache.columns == columns {
+                None
+            } else {
+                Some(device.gather_columns(&cache.tensors[slot], cache.columns, columns)?)
+            };
+            let source = widened
+                .as_ref()
+                .map_or(&cache.tensors[slot], |(tensor, _)| tensor);
+            let mut rows = Vec::new();
+            let mut keep = Vec::new();
+            let next = match &merged {
+                // Rows of the source follow the rows gathered before.
+                Some((before, _, count)) => {
+                    for row in 0..*count {
+                        rows.push(index(row)?);
+                    }
+                    keep.resize(count * columns, true);
+                    for pick in *picks {
+                        rows.push(index(count + pick.row)?);
+                    }
+                    keep_of(cache, picks, &mut keep);
+                    let (tensor, owner) =
+                        device.gather_rows(before, Some(source), &rows, &keep, columns)?;
+                    (tensor, owner, count + picks.len())
+                }
+                None => {
+                    // The first source, and with it the second when it
+                    // needs no widening: one pass for the usual join.
+                    let second = rest
+                        .clone()
+                        .next()
+                        .filter(|(second, _)| second.columns == columns);
+                    for pick in *picks {
+                        rows.push(index(pick.row)?);
+                    }
+                    keep_of(cache, picks, &mut keep);
+                    let mut count = picks.len();
+                    if let Some((second, second_picks)) = second {
+                        rest.next();
+                        for pick in *second_picks {
+                            rows.push(index(cache.rows + pick.row)?);
+                        }
+                        keep_of(second, second_picks, &mut keep);
+                        count += second_picks.len();
+                    }
+                    let (tensor, owner) = device.gather_rows(
+                        source,
+                        second.map(|(second, _)| &second.tensors[slot]),
+                        &rows,
+                        &keep,
+                        columns,
+                    )?;
+                    (tensor, owner, count)
+                }
+            };
+            merged = Some(next);
+        }
+        if let Some((tensor, owner, _)) = merged {
+            tensors.push(tensor);
+            allocator = Some(owner);
+        }
     }
     Ok((tensors, allocator))
 }
@@ -378,7 +466,7 @@ mod tests {
         let cache = numbered(3, 2, 2, 2);
 
         // Act -- rows 2 and 0: row 1 leaves.
-        let kept = KvCache::gather(&[(&cache, &[RowPick::copy(2), RowPick::copy(0)])], HOST)
+        let kept = KvCache::gather(&[(&cache, &[RowPick::copy(2), RowPick::copy(0)])], 2, HOST)
             .expect("gather");
 
         // Assert
@@ -399,14 +487,15 @@ mod tests {
         // Arrange
         let running = numbered(1, 2, 3, 1);
         let joining = numbered(2, 2, 3, 1);
-        let picks = [RowPick {
-            row: 1,
-            zero_columns: 2,
-        }];
+        let picks = [RowPick::after_padding(1, 2)];
 
         // Act
-        let merged = KvCache::gather(&[(&running, &[RowPick::copy(0)]), (&joining, &picks)], HOST)
-            .expect("gather");
+        let merged = KvCache::gather(
+            &[(&running, &[RowPick::copy(0)]), (&joining, &picks)],
+            3,
+            HOST,
+        )
+        .expect("gather");
 
         // Assert -- the joining row keeps its last column in both heads.
         let (shape, data) = contents(&merged);
@@ -420,14 +509,44 @@ mod tests {
     }
 
     #[test]
-    fn gather_refuses_caches_that_do_not_fit_together() {
+    fn gather_refuses_rows_that_are_not_there() {
         let narrow = numbered(1, 2, 2, 1);
-        let wide = numbered(1, 2, 3, 1);
-        let row = [RowPick::copy(0)];
 
-        assert!(KvCache::gather(&[(&narrow, &row), (&wide, &row)], HOST).is_err());
-        assert!(KvCache::gather(&[(&narrow, &[RowPick::copy(1)])], HOST).is_err());
-        assert!(KvCache::gather(&[(&narrow, &[])], HOST).is_err());
+        assert!(KvCache::gather(&[(&narrow, &[RowPick::copy(1)])], 2, HOST).is_err());
+        assert!(KvCache::gather(&[(&narrow, &[])], 2, HOST).is_err());
+    }
+
+    #[test]
+    fn gather_brings_caches_of_different_widths_to_one_width() {
+        // Arrange -- rows that start at column 0: one 2 columns wide, one
+        // 4 wide of which the row has used 3.
+        let narrow = numbered(1, 2, 2, 1);
+        let wide = numbered(2, 2, 4, 1);
+        let parts: [(&KvCache, &[RowPick]); 2] = [
+            (&narrow, &[RowPick::copy(0)]),
+            (&wide, &[RowPick::first(1, 3)]),
+        ];
+
+        // Act -- to the width of the longer row, and to less than that.
+        let widened = KvCache::gather(&parts, 3, HOST).expect("widen");
+        let cut = KvCache::gather(&parts, 1, HOST).expect("cut");
+
+        // Assert -- entries stay in their columns; zeros on the right.
+        assert_eq!(widened.columns(), 3);
+        assert_eq!(
+            contents(&widened),
+            (
+                vec![2, 2, 3, 1],
+                vec![
+                    0.0, 10.0, 0.0, 100.0, 110.0, 0.0, //
+                    1000.0, 1010.0, 1020.0, 1100.0, 1110.0, 1120.0,
+                ]
+            )
+        );
+        assert_eq!(
+            contents(&cut),
+            (vec![2, 2, 1, 1], vec![0.0, 100.0, 1000.0, 1100.0])
+        );
     }
 
     /// `numbered`, in the given float type.
@@ -456,19 +575,13 @@ mod tests {
     fn gather_copies_float16_caches_like_float32_ones() {
         // Arrange -- what float32 gathers, rounded to float16 (which
         // holds whole numbers exactly only up to 2048).
-        let picks = [
-            RowPick {
-                row: 1,
-                zero_columns: 2,
-            },
-            RowPick::copy(0),
-        ];
+        let picks = [RowPick::after_padding(1, 2), RowPick::copy(0)];
         let expected = {
             let running = numbered_as(FloatType::F32, 3, 3);
             let joining = numbered_as(FloatType::F32, 2, 3);
             let keep = [RowPick::copy(2), RowPick::copy(0)];
             let (shape, data) = values(
-                &KvCache::gather(&[(&running, &keep), (&joining, &picks)], HOST).expect("f32"),
+                &KvCache::gather(&[(&running, &keep), (&joining, &picks)], 3, HOST).expect("f32"),
             );
             let rounded = data
                 .into_iter()
@@ -483,6 +596,7 @@ mod tests {
         // Act
         let merged = KvCache::gather(
             &[(&running, &keep), (&joining, &picks)],
+            3,
             CacheHome::Host(FloatType::F16),
         )
         .expect("f16");
@@ -495,9 +609,9 @@ mod tests {
         assert_eq!(values(&merged), expected);
         assert_eq!(expected.0, vec![4, 2, 3, 3]);
         // A float16 cache is not read as float32, nor the other way round.
-        assert!(KvCache::gather(&[(&running, &keep)], HOST).is_err());
+        assert!(KvCache::gather(&[(&running, &keep)], 3, HOST).is_err());
         let full = numbered_as(FloatType::F32, 3, 3);
-        assert!(KvCache::gather(&[(&full, &keep)], CacheHome::Host(FloatType::F16)).is_err());
+        assert!(KvCache::gather(&[(&full, &keep)], 3, CacheHome::Host(FloatType::F16)).is_err());
     }
 
     #[test]
@@ -515,55 +629,69 @@ mod tests {
             .expect("session");
         let cpu = ExecutionProvider::Cpu;
         let device = ComputeDevice::of(&cpu).expect("the CPU is a device");
-        let moves: [(&[RowPick], Option<&[RowPick]>); 6] = [
+        // (rows of a cache 4 wide, rows of a second cache, its width,
+        // width of the result).
+        type Move<'a> = (&'a [RowPick], Option<&'a [RowPick]>, usize, usize);
+        let moves: [Move<'_>; 10] = [
             // Rows leave: from the end, the middle, the front.
-            (&[RowPick::copy(0), RowPick::copy(1)], None),
-            (&[RowPick::copy(0), RowPick::copy(2)], None),
-            (&[RowPick::copy(2)], None),
+            (&[RowPick::copy(0), RowPick::copy(1)], None, 4, 4),
+            (&[RowPick::copy(0), RowPick::copy(2)], None, 4, 4),
+            (&[RowPick::copy(2)], None, 4, 4),
             // Rows join an empty batch, one of them padded.
             (
-                &[
-                    RowPick::copy(1),
-                    RowPick {
-                        row: 0,
-                        zero_columns: 3,
-                    },
-                ],
+                &[RowPick::copy(1), RowPick::after_padding(0, 3)],
                 None,
+                4,
+                4,
             ),
             // Rows join running ones: padded, unpadded, all padding.
             (
                 &[RowPick::copy(0), RowPick::copy(1), RowPick::copy(2)],
-                Some(&[
-                    RowPick {
-                        row: 1,
-                        zero_columns: 2,
-                    },
-                    RowPick::copy(0),
-                ]),
+                Some(&[RowPick::after_padding(1, 2), RowPick::copy(0)]),
+                4,
+                4,
             ),
             (
                 &[RowPick::copy(1)],
-                Some(&[RowPick {
-                    row: 0,
-                    zero_columns: 4,
-                }]),
+                Some(&[RowPick::after_padding(0, 4)]),
+                4,
+                4,
             ),
+            // Rows that start at column 0. The longest leaves and the
+            // cache is cut back to the rows that stay.
+            (&[RowPick::first(2, 2), RowPick::first(0, 3)], None, 4, 3),
+            // A shorter row joins: its cache is widened.
+            (
+                &[RowPick::first(0, 4), RowPick::first(1, 2)],
+                Some(&[RowPick::first(1, 2)]),
+                2,
+                4,
+            ),
+            // A longer row joins: the running cache is widened.
+            (
+                &[RowPick::first(0, 4), RowPick::first(2, 3)],
+                Some(&[RowPick::first(0, 6), RowPick::first(1, 5)]),
+                6,
+                6,
+            ),
+            // Both at once: one is cut, the other widened.
+            (&[RowPick::first(1, 4)], Some(&[RowPick::first(0, 1)]), 1, 3),
         ];
 
         for float in [FloatType::F32, FloatType::F16] {
             let mut run =
                 DeviceRun::new(&session, &cpu, device, float, FloatType::F32).expect("device run");
             let first = numbered_as(float, 3, 4);
-            let second = numbered_as(float, 2, 4);
-            for (picks, joining) in moves {
+            for (picks, joining, second_width, columns) in moves {
+                let second = numbered_as(float, 2, second_width);
                 let mut parts: Vec<(&KvCache, &[RowPick])> = vec![(&first, picks)];
                 parts.extend(joining.map(|joining| (&second, joining)));
 
                 // Act
-                let on_host = KvCache::gather(&parts, CacheHome::Host(float)).expect("host");
+                let on_host =
+                    KvCache::gather(&parts, columns, CacheHome::Host(float)).expect("host");
                 let on_device =
-                    KvCache::gather(&parts, CacheHome::Device(&mut run)).expect("device");
+                    KvCache::gather(&parts, columns, CacheHome::Device(&mut run)).expect("device");
 
                 // Assert
                 assert_eq!(on_device.rows(), on_host.rows());
@@ -573,14 +701,24 @@ mod tests {
                     values(&on_host),
                     "{float:?} {picks:?} {joining:?}"
                 );
+                assert_eq!(on_device.columns(), columns);
             }
 
-            // More than two caches at once is not something a batch does.
-            let row = [RowPick::copy(0)];
-            let three: [(&KvCache, &[RowPick]); 3] =
-                [(&first, &row), (&second, &row), (&first, &row)];
-            assert!(KvCache::gather(&three, CacheHome::Device(&mut run)).is_err());
-            assert!(KvCache::gather(&three, CacheHome::Host(float)).is_ok());
+            // Several requests join at once, each read alone: more than
+            // two caches, of three widths.
+            let second = numbered_as(float, 2, 2);
+            let third = numbered_as(float, 1, 5);
+            let several: [(&KvCache, &[RowPick]); 4] = [
+                (&first, &[RowPick::first(2, 4), RowPick::first(0, 3)]),
+                (&second, &[RowPick::first(1, 2)]),
+                (&third, &[RowPick::first(0, 5)]),
+                (&second, &[RowPick::first(0, 2)]),
+            ];
+            let on_host = KvCache::gather(&several, 5, CacheHome::Host(float)).expect("host");
+            let on_device =
+                KvCache::gather(&several, 5, CacheHome::Device(&mut run)).expect("device");
+            assert_eq!(on_device.rows(), 5);
+            assert_eq!(values(&on_device), values(&on_host), "{float:?} several");
         }
     }
 }
