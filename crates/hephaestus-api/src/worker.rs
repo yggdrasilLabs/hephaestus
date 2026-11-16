@@ -29,7 +29,7 @@
 //! ([`run_generation_batch`]). Between two token steps the worker takes
 //! waiting requests off the queue, without blocking, for as long as the
 //! batch has a free place and the next request's prompt fits it; their
-//! prompts are read in one forward pass of their own and they then decode
+//! prompts are read in forward passes of their own and they then decode
 //! with the others. A request leaves, and is answered, in the step it
 //! ends: end token, token limit, its deadline, or its caller going away.
 //! The others go on.
@@ -37,7 +37,9 @@
 //! Requests still start in arrival order. One whose prompt does not fit
 //! the running batch waits at the head of the queue, and holds back those
 //! behind it, until the batch has grown or emptied; that is what keeps a
-//! misfit from waiting forever. The queue capacity counts waiting
+//! misfit from waiting forever. (Whether a prompt can fail to fit depends
+//! on the row layout the graph needs: see `generation_batch.rs` in the
+//! core crate. With rows that start at column 0 every prompt fits.) The queue capacity counts waiting
 //! requests only, as before: a request stops counting when it joins.
 
 use std::collections::{HashMap, VecDeque};

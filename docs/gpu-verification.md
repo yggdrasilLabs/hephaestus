@@ -64,6 +64,11 @@ For every graph:
    it, if the provider cannot be registered, the session cannot be created
    on the GPU, a helper graph cannot be placed entirely on the GPU, or the
    first forward pass returns its cache anywhere but in GPU memory.
+   Loading also runs the startup check of batching (README, "Batched
+   generation"); the test prints its result (`startup check of batching:
+   Passed(StartAligned)` for an ONNX Runtime GenAI export such as
+   `onnx-community/Qwen3-4B-Instruct-2507-ONNX`, `Passed(EndAligned)` for
+   an Optimum export) and fails here if the check found no layout.
 3. Generates every prompt alone on the GPU and compares it with the CPU
    run, step by step.
 4. Generates every prompt through a batch three times (all together, in
